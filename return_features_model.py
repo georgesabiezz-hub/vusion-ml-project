@@ -261,3 +261,82 @@ for name, m, beats in [("LogReg", lr_metrics, beats_baseline_lr),
     verdict = "BEATS" if beats else "FAILS TO BEAT"
     print(f"  {name}: {verdict} baseline  "
           f"(Accuracy {gap_acc:+.4f} vs baseline, AUC {gap_auc:+.4f} vs 0.5)")
+
+# =============================================================================
+# THRESHOLD SWEEP — RF Classifier predicted probabilities
+# =============================================================================
+print("\n\n" + "="*70)
+print("THRESHOLD SWEEP — RandomForestClassifier  (label_20d_up)")
+print("Using rf_prob = rf_cls.predict_proba(X_test)[:, 1]")
+print("="*70)
+
+THRESHOLDS = [0.5, 0.6, 0.7, 0.8]
+
+rows = []
+for thr in THRESHOLDS:
+    pred_up   = (rf_prob >= thr).astype(int)
+    n_pred_up = pred_up.sum()
+    pct_up    = n_pred_up / len(pred_up)
+
+    # guard: if threshold is so high nothing is predicted positive, metrics are 0
+    acc  = accuracy_score(y_te, pred_up)
+    prec = precision_score(y_te, pred_up, zero_division=0)
+    rec  = recall_score(y_te, pred_up, zero_division=0)
+    f1   = f1_score(y_te, pred_up, zero_division=0)
+
+    rows.append({
+        "threshold":       thr,
+        "accuracy":        acc,
+        "precision":       prec,
+        "recall":          rec,
+        "f1":              f1,
+        "pct_days_pred_up": pct_up,
+        "n_days_pred_up":  n_pred_up,
+    })
+
+thr_df = pd.DataFrame(rows)
+
+# Print table
+print(f"\n{'Threshold':>10} {'Accuracy':>10} {'Precision':>10} {'Recall':>10} "
+      f"{'F1':>8} {'%Days Up':>10} {'#Days Up':>10}")
+print("-"*72)
+# Baseline row first
+print(f"{'baseline':>10} {baseline_acc:>10.4f} {'—':>10} {'—':>10} "
+      f"{'—':>8} {'100.0%':>10} {len(y_te):>10}   (always predict 1)")
+print("-"*72)
+for _, r in thr_df.iterrows():
+    print(
+        f"{r['threshold']:>10.1f} "
+        f"{r['accuracy']:>10.4f} "
+        f"{r['precision']:>10.4f} "
+        f"{r['recall']:>10.4f} "
+        f"{r['f1']:>8.4f} "
+        f"{r['pct_days_pred_up']:>9.1%} "
+        f"{int(r['n_days_pred_up']):>10}"
+    )
+
+# Precision vs baseline accuracy gain at each threshold
+print("\n  Precision lift over baseline accuracy (0.5347):")
+for _, r in thr_df.iterrows():
+    lift = r["precision"] - baseline_acc
+    flag = "  ✓ beats baseline" if r["precision"] > baseline_acc else "  ✗ below baseline"
+    print(f"    thr={r['threshold']:.1f}  precision={r['precision']:.4f}  lift={lift:+.4f}{flag}")
+
+print("\n" + "="*70)
+print("INTERPRETATION")
+print("="*70)
+print("""
+  At threshold=0.5 (default): the model predicts 'up' on most test days,
+  mirroring the overall class distribution. Precision ≈ market base rate.
+
+  As the threshold rises:
+    - Precision climbs  → the model becomes more selective and more accurate
+      on the days it does signal.
+    - Recall falls      → fewer actual 'up' days are captured.
+    - %Days predicted up shrinks → you trade less often.
+    - F1 may rise then fall depending on the precision/recall trade-off.
+
+  The sweet spot for a long-only strategy is the threshold where precision
+  meaningfully exceeds the baseline accuracy (0.5347) at an acceptable
+  coverage (enough trading days to matter in practice).
+""")

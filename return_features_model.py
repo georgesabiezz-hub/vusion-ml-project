@@ -1,7 +1,13 @@
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    r2_score, mean_absolute_error,
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    classification_report,
+)
 
 DATA_PATH = "vu_pa_history_features.csv"
 
@@ -165,3 +171,93 @@ for t in TARGETS:
 print("\n(▲/▼ for R²: higher is better  |  ▲/▼ for MAE: lower is better)")
 print(f"\nFeature count: v1={len(FEATURE_COLS_V1)}  →  v2={len(FEATURE_COLS_V2)}"
       f"  (+{len(NEW_FEATURES)} new indicators)")
+
+# =============================================================================
+# CLASSIFICATION — 20-day up/down label
+# =============================================================================
+print("\n\n" + "="*70)
+print("CLASSIFICATION: Will adj_close be higher in 20 trading days?")
+print("="*70)
+
+df["label_20d_up"] = (df["y_next_ret_20d"] > 0).astype(int)
+
+X_cls = df[FEATURE_COLS_V2].replace([np.inf, -np.inf], np.nan).fillna(0)
+y_cls = df["label_20d_up"]
+
+X_tr, X_te = X_cls.iloc[:split], X_cls.iloc[split:]
+y_tr, y_te = y_cls.iloc[:split], y_cls.iloc[split:]
+
+# Class distribution
+pos_train = y_tr.mean()
+pos_test  = y_te.mean()
+majority_class = int(pos_test >= 0.5)
+baseline_acc   = max(pos_test, 1 - pos_test)
+print(f"\nLabel distribution  —  train: {pos_train:.1%} up  |  test: {pos_test:.1%} up")
+print(f"Majority-class baseline accuracy (always predict {majority_class}): {baseline_acc:.4f}")
+
+# --- Logistic Regression (needs scaled features) ---
+scaler    = StandardScaler()
+X_tr_sc   = scaler.fit_transform(X_tr)
+X_te_sc   = scaler.transform(X_te)
+
+lr = LogisticRegression(C=0.1, max_iter=1000, random_state=42)
+lr.fit(X_tr_sc, y_tr)
+lr_pred      = lr.predict(X_te_sc)
+lr_prob      = lr.predict_proba(X_te_sc)[:, 1]
+
+# --- Random Forest Classifier ---
+rf_cls = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+rf_cls.fit(X_tr, y_tr)
+rf_pred = rf_cls.predict(X_te)
+rf_prob = rf_cls.predict_proba(X_te)[:, 1]
+
+# --- Metrics helper ---
+def cls_metrics(y_true, y_pred, y_prob):
+    return {
+        "Accuracy":  accuracy_score(y_true, y_pred),
+        "Precision": precision_score(y_true, y_pred, zero_division=0),
+        "Recall":    recall_score(y_true, y_pred, zero_division=0),
+        "F1":        f1_score(y_true, y_pred, zero_division=0),
+        "ROC-AUC":   roc_auc_score(y_true, y_prob),
+    }
+
+lr_metrics = cls_metrics(y_te, lr_pred, lr_prob)
+rf_metrics = cls_metrics(y_te, rf_pred, rf_prob)
+
+# --- Print detailed report ---
+for name, metrics, preds in [
+    ("Logistic Regression (C=0.1)", lr_metrics, lr_pred),
+    ("Random Forest Classifier (200 trees)", rf_metrics, rf_pred),
+]:
+    print(f"\n{'─'*50}")
+    print(f"  {name}")
+    print(f"{'─'*50}")
+    for k, v in metrics.items():
+        print(f"  {k:<12}: {v:.4f}")
+
+# --- Side-by-side comparison ---
+print("\n\n" + "="*70)
+print(f"{'Metric':<14} {'Baseline':>10} {'LogReg':>10} {'RF Clf':>10}")
+print("-"*46)
+metrics_list = ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC"]
+baseline_vals = {"Accuracy": baseline_acc, "Precision": "—", "Recall": "—",
+                 "F1": "—", "ROC-AUC": 0.5}
+for m in metrics_list:
+    bv = baseline_vals[m]
+    bv_str = f"{bv:.4f}" if isinstance(bv, float) else f"{'—':>10}"
+    print(f"{m:<14} {bv_str:>10} {lr_metrics[m]:>10.4f} {rf_metrics[m]:>10.4f}")
+
+# --- Verdict ---
+print("\n" + "="*70)
+print("VERDICT")
+print("="*70)
+beats_baseline_lr = lr_metrics["Accuracy"] > baseline_acc and lr_metrics["ROC-AUC"] > 0.5
+beats_baseline_rf = rf_metrics["Accuracy"] > baseline_acc and rf_metrics["ROC-AUC"] > 0.5
+
+for name, m, beats in [("LogReg", lr_metrics, beats_baseline_lr),
+                        ("RF Clf", rf_metrics, beats_baseline_rf)]:
+    gap_acc = m["Accuracy"] - baseline_acc
+    gap_auc = m["ROC-AUC"] - 0.5
+    verdict = "BEATS" if beats else "FAILS TO BEAT"
+    print(f"  {name}: {verdict} baseline  "
+          f"(Accuracy {gap_acc:+.4f} vs baseline, AUC {gap_auc:+.4f} vs 0.5)")

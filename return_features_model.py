@@ -8,6 +8,7 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
     classification_report,
 )
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 import xgboost as xgb
 import lightgbm as lgb
 
@@ -512,3 +513,123 @@ print(f"    XGBoost  {'IMPROVES' if xgb_prec_beats_rf else 'does NOT improve'} o
       f"(Δ={get_thr_row(xgb_sweep,0.6)['prec']-rf_06['precision']:+.4f})")
 print(f"    LightGBM {'IMPROVES' if lgb_prec_beats_rf else 'does NOT improve'} over RF  "
       f"(Δ={get_thr_row(lgb_sweep,0.6)['prec']-rf_06['precision']:+.4f})")
+
+# =============================================================================
+# LIGHTGBM HYPERPARAMETER SEARCH WITH TIME-SERIES CROSS-VALIDATION
+# =============================================================================
+print("\n\n" + "="*70)
+print("LIGHTGBM — TIME-SERIES HYPERPARAMETER SEARCH")
+print("TimeSeriesSplit(n_splits=5), scoring=roc_auc, train set only")
+print("="*70)
+
+PARAM_GRID = {
+    "n_estimators":     [100, 200, 300],
+    "learning_rate":    [0.03, 0.05, 0.1],
+    "max_depth":        [3, 4, 5, -1],
+    "num_leaves":       [15, 31, 63],
+    "min_data_in_leaf": [10, 20, 50],
+    "feature_fraction": [0.6, 0.8, 1.0],
+}
+
+total_combos = 1
+for v in PARAM_GRID.values():
+    total_combos *= len(v)
+print(f"\nGrid size: {total_combos} combinations × 5 folds = {total_combos*5} fits")
+print("Running search (n_jobs=-1) …\n")
+
+tscv = TimeSeriesSplit(n_splits=5)
+
+lgb_base_for_search = lgb.LGBMClassifier(
+    is_unbalance=True,
+    random_state=42,
+    n_jobs=-1,
+    verbose=-1,
+)
+
+grid_search = GridSearchCV(
+    estimator=lgb_base_for_search,
+    param_grid=PARAM_GRID,
+    cv=tscv,
+    scoring="roc_auc",
+    n_jobs=-1,
+    refit=False,       # we'll refit manually with best params
+    verbose=0,
+)
+grid_search.fit(X_tr, y_tr)
+
+best_params = grid_search.best_params_
+best_cv_auc = grid_search.best_score_
+
+print(f"Best CV ROC-AUC (train folds): {best_cv_auc:.4f}")
+print("Best hyperparameters:")
+for k, v in best_params.items():
+    print(f"  {k:<22}: {v}")
+
+# --- Refit on full train set with best params ---
+lgb_tuned = lgb.LGBMClassifier(
+    **best_params,
+    is_unbalance=True,
+    random_state=42,
+    n_jobs=-1,
+    verbose=-1,
+)
+lgb_tuned.fit(X_tr, y_tr)
+lgb_tuned_pred = lgb_tuned.predict(X_te)
+lgb_tuned_prob = lgb_tuned.predict_proba(X_te)[:, 1]
+lgb_tuned_m    = full_metrics(y_te, lgb_tuned_pred, lgb_tuned_prob)
+
+# --- Full metric table vs default LightGBM ---
+print("\n" + "="*70)
+print("TEST-SET METRICS: default LightGBM vs tuned LightGBM")
+print("="*70)
+print(f"\n{'Metric':<12} {'Baseline':>10} {'LGB default':>12} {'LGB tuned':>12} {'Δ (tuned−def)':>15}")
+print("-"*63)
+for metric in ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC"]:
+    bv  = baseline_acc if metric == "Accuracy" else (0.5 if metric == "ROC-AUC" else None)
+    bvs = f"{bv:.4f}" if bv is not None else "—"
+    d   = lgb_m[metric]
+    t   = lgb_tuned_m[metric]
+    delta = t - d
+    arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "─")
+    print(f"{metric:<12} {bvs:>10} {d:>12.4f} {t:>12.4f} {arrow}{abs(delta):>13.4f}")
+
+# --- Threshold sweep for tuned model ---
+lgb_tuned_sweep = threshold_sweep(lgb_tuned_prob, y_te, "LightGBM (tuned)")
+
+# --- Side-by-side at thr=0.6 ---
+lgb_def_06   = get_thr_row(lgb_sweep, 0.6)
+lgb_tuned_06 = get_thr_row(lgb_tuned_sweep, 0.6)
+
+print("\n" + "="*70)
+print("THRESHOLD = 0.6 — default vs tuned LightGBM")
+print("="*70)
+print(f"\n  {'Metric':<20} {'LGB default':>12} {'LGB tuned':>12} {'Δ':>10}  {'Change'}")
+print("  " + "-"*62)
+
+key_pairs = [
+    ("ROC-AUC (thr-free)", lgb_m["ROC-AUC"],   lgb_tuned_m["ROC-AUC"], False),
+    ("Precision @0.6",     lgb_def_06["prec"],  lgb_tuned_06["prec"],   False),
+    ("Recall @0.6",        lgb_def_06["rec"],   lgb_tuned_06["rec"],    False),
+    ("F1 @0.6",            lgb_def_06["f1"],    lgb_tuned_06["f1"],     False),
+    ("% Days Up @0.6",     lgb_def_06["pct"],   lgb_tuned_06["pct"],    True),
+]
+
+for label, dv, tv, is_pct in key_pairs:
+    delta = tv - dv
+    fmt   = ".1%" if is_pct else ".4f"
+    tag   = "IMPROVED" if delta > 0 else ("WORSE" if delta < 0 else "same")
+    print(f"  {label:<20} {dv:>12{fmt}} {tv:>12{fmt}} {delta:>+10{fmt}}  {tag}")
+
+print("\n" + "="*70)
+print("FINAL VERDICT — tuned LightGBM vs default LightGBM")
+print("="*70)
+auc_improved  = lgb_tuned_m["ROC-AUC"] > lgb_m["ROC-AUC"]
+prec_improved = lgb_tuned_06["prec"]   > lgb_def_06["prec"]
+
+print(f"\n  ROC-AUC:          {'IMPROVED' if auc_improved  else 'did NOT improve'}  "
+      f"({lgb_m['ROC-AUC']:.4f} → {lgb_tuned_m['ROC-AUC']:.4f}, "
+      f"Δ={lgb_tuned_m['ROC-AUC']-lgb_m['ROC-AUC']:+.4f})")
+print(f"  Precision @0.6:   {'IMPROVED' if prec_improved else 'did NOT improve'}  "
+      f"({lgb_def_06['prec']:.4f} → {lgb_tuned_06['prec']:.4f}, "
+      f"Δ={lgb_tuned_06['prec']-lgb_def_06['prec']:+.4f})")
+print(f"  Best CV AUC (train folds): {best_cv_auc:.4f}")

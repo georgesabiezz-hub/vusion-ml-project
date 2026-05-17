@@ -8,7 +8,8 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
     classification_report,
 )
-from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+from scipy.stats import randint, uniform
 import xgboost as xgb
 import lightgbm as lgb
 
@@ -515,29 +516,26 @@ print(f"    LightGBM {'IMPROVES' if lgb_prec_beats_rf else 'does NOT improve'} o
       f"(Δ={get_thr_row(lgb_sweep,0.6)['prec']-rf_06['precision']:+.4f})")
 
 # =============================================================================
-# LIGHTGBM HYPERPARAMETER SEARCH WITH TIME-SERIES CROSS-VALIDATION
+# LIGHTGBM — RANDOMIZED HYPERPARAMETER SEARCH WITH TIME-SERIES CV
 # =============================================================================
 print("\n\n" + "="*70)
-print("LIGHTGBM — TIME-SERIES HYPERPARAMETER SEARCH")
-print("TimeSeriesSplit(n_splits=5), scoring=roc_auc, train set only")
+print("LIGHTGBM — RANDOMIZED HYPERPARAMETER SEARCH")
+print("50 random combos × TimeSeriesSplit(n_splits=4), scoring=roc_auc")
 print("="*70)
 
-PARAM_GRID = {
-    "n_estimators":     [100, 200, 300],
-    "learning_rate":    [0.03, 0.05, 0.1],
-    "max_depth":        [3, 4, 5, -1],
-    "num_leaves":       [15, 31, 63],
-    "min_data_in_leaf": [10, 20, 50],
-    "feature_fraction": [0.6, 0.8, 1.0],
+PARAM_DIST = {
+    "n_estimators":     randint(200, 801),       # 200–800
+    "learning_rate":    uniform(0.03, 0.07),     # 0.03–0.10
+    "max_depth":        randint(3, 7),            # 3–6
+    "num_leaves":       randint(15, 64),          # 15–63
+    "min_data_in_leaf": randint(20, 101),         # 20–100
+    "feature_fraction": uniform(0.6, 0.4),        # 0.6–1.0
 }
 
-total_combos = 1
-for v in PARAM_GRID.values():
-    total_combos *= len(v)
-print(f"\nGrid size: {total_combos} combinations × 5 folds = {total_combos*5} fits")
+print(f"\n50 random samples × 4 folds = 200 fits")
 print("Running search (n_jobs=-1) …\n")
 
-tscv = TimeSeriesSplit(n_splits=5)
+tscv = TimeSeriesSplit(n_splits=4)
 
 lgb_base_for_search = lgb.LGBMClassifier(
     is_unbalance=True,
@@ -546,19 +544,21 @@ lgb_base_for_search = lgb.LGBMClassifier(
     verbose=-1,
 )
 
-grid_search = GridSearchCV(
+rand_search = RandomizedSearchCV(
     estimator=lgb_base_for_search,
-    param_grid=PARAM_GRID,
+    param_distributions=PARAM_DIST,
+    n_iter=50,
     cv=tscv,
     scoring="roc_auc",
     n_jobs=-1,
-    refit=False,       # we'll refit manually with best params
+    refit=False,
+    random_state=42,
     verbose=0,
 )
-grid_search.fit(X_tr, y_tr)
+rand_search.fit(X_tr, y_tr)
 
-best_params = grid_search.best_params_
-best_cv_auc = grid_search.best_score_
+best_params = rand_search.best_params_
+best_cv_auc = rand_search.best_score_
 
 print(f"Best CV ROC-AUC (train folds): {best_cv_auc:.4f}")
 print("Best hyperparameters:")
@@ -580,7 +580,7 @@ lgb_tuned_m    = full_metrics(y_te, lgb_tuned_pred, lgb_tuned_prob)
 
 # --- Full metric table vs default LightGBM ---
 print("\n" + "="*70)
-print("TEST-SET METRICS: default LightGBM vs tuned LightGBM")
+print("TEST-SET METRICS: default LightGBM vs tuned LightGBM (randomized search)")
 print("="*70)
 print(f"\n{'Metric':<12} {'Baseline':>10} {'LGB default':>12} {'LGB tuned':>12} {'Δ (tuned−def)':>15}")
 print("-"*63)

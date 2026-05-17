@@ -8,6 +8,8 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
     classification_report,
 )
+import xgboost as xgb
+import lightgbm as lgb
 
 DATA_PATH = "vu_pa_history_features.csv"
 
@@ -340,3 +342,173 @@ print("""
   meaningfully exceeds the baseline accuracy (0.5347) at an acceptable
   coverage (enough trading days to matter in practice).
 """)
+
+# =============================================================================
+# BOOSTED-TREE CLASSIFIERS — XGBoost and LightGBM
+# =============================================================================
+print("\n" + "="*70)
+print("BOOSTED-TREE CLASSIFIERS — XGBoost & LightGBM  (label_20d_up)")
+print("="*70)
+
+pos_ratio = float(y_tr.mean())
+
+xgb_clf = xgb.XGBClassifier(
+    n_estimators=300,
+    learning_rate=0.05,
+    max_depth=4,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    scale_pos_weight=(1 - pos_ratio) / pos_ratio,  # handle class imbalance
+    eval_metric="logloss",
+    random_state=42,
+    n_jobs=-1,
+    verbosity=0,
+)
+xgb_clf.fit(X_tr, y_tr)
+xgb_pred = xgb_clf.predict(X_te)
+xgb_prob = xgb_clf.predict_proba(X_te)[:, 1]
+
+lgb_clf = lgb.LGBMClassifier(
+    n_estimators=300,
+    learning_rate=0.05,
+    max_depth=4,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    is_unbalance=True,
+    random_state=42,
+    n_jobs=-1,
+    verbose=-1,
+)
+lgb_clf.fit(X_tr, y_tr)
+lgb_pred = lgb_clf.predict(X_te)
+lgb_prob = lgb_clf.predict_proba(X_te)[:, 1]
+
+
+def full_metrics(y_true, y_pred, y_prob):
+    return {
+        "Accuracy":  accuracy_score(y_true, y_pred),
+        "Precision": precision_score(y_true, y_pred, zero_division=0),
+        "Recall":    recall_score(y_true, y_pred, zero_division=0),
+        "F1":        f1_score(y_true, y_pred, zero_division=0),
+        "ROC-AUC":   roc_auc_score(y_true, y_prob),
+    }
+
+xgb_m = full_metrics(y_te, xgb_pred, xgb_prob)
+lgb_m = full_metrics(y_te, lgb_pred, lgb_prob)
+
+print(f"\n{'Metric':<12} {'Baseline':>10} {'RF Clf':>10} {'XGBoost':>10} {'LightGBM':>10}")
+print("-"*54)
+for metric in ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC"]:
+    bv = baseline_acc if metric == "Accuracy" else (0.5 if metric == "ROC-AUC" else "—")
+    bv_s = f"{bv:.4f}" if isinstance(bv, float) else "—"
+    print(
+        f"{metric:<12} {bv_s:>10} "
+        f"{rf_metrics[metric]:>10.4f} "
+        f"{xgb_m[metric]:>10.4f} "
+        f"{lgb_m[metric]:>10.4f}"
+    )
+
+# --- Threshold sweep for both boosted models ---
+def threshold_sweep(probs, y_true, model_name):
+    print(f"\n  Threshold sweep — {model_name}")
+    print(f"  {'Thr':>5} {'Acc':>8} {'Prec':>8} {'Rec':>8} {'F1':>8} {'%Up':>8} {'#Up':>6}")
+    print(f"  {'base':>5} {baseline_acc:>8.4f} {'—':>8} {'—':>8} {'—':>8} {'100%':>8} {len(y_true):>6}  (always 1)")
+    print("  " + "-"*57)
+    sweep_rows = []
+    for thr in THRESHOLDS:
+        p = (probs >= thr).astype(int)
+        n = p.sum()
+        sweep_rows.append({
+            "thr":  thr,
+            "acc":  accuracy_score(y_true, p),
+            "prec": precision_score(y_true, p, zero_division=0),
+            "rec":  recall_score(y_true, p, zero_division=0),
+            "f1":   f1_score(y_true, p, zero_division=0),
+            "pct":  n / len(p),
+            "n":    n,
+        })
+        print(
+            f"  {thr:>5.1f} "
+            f"{sweep_rows[-1]['acc']:>8.4f} "
+            f"{sweep_rows[-1]['prec']:>8.4f} "
+            f"{sweep_rows[-1]['rec']:>8.4f} "
+            f"{sweep_rows[-1]['f1']:>8.4f} "
+            f"{sweep_rows[-1]['pct']:>7.1%} "
+            f"{n:>6}"
+        )
+    return sweep_rows
+
+xgb_sweep = threshold_sweep(xgb_prob, y_te, "XGBoost")
+lgb_sweep = threshold_sweep(lgb_prob, y_te, "LightGBM")
+
+# --- Head-to-head at thr=0.6 ---
+def get_thr_row(sweep, thr):
+    return next(r for r in sweep if r["thr"] == thr)
+
+rf_06 = next(r for _, r in thr_df.iterrows() if r["threshold"] == 0.6)
+
+print("\n" + "="*70)
+print("HEAD-TO-HEAD AT THRESHOLD = 0.6  (key comparison)")
+print("="*70)
+print(f"\n  {'Metric':<18} {'RF Clf':>10} {'XGBoost':>10} {'LightGBM':>10}  {'Winner':>10}")
+print("  " + "-"*60)
+
+comparisons = [
+    ("ROC-AUC (thr-free)", rf_metrics["ROC-AUC"], xgb_m["ROC-AUC"], lgb_m["ROC-AUC"]),
+    ("Precision @0.6",     rf_06["precision"],
+     get_thr_row(xgb_sweep, 0.6)["prec"],
+     get_thr_row(lgb_sweep, 0.6)["prec"]),
+    ("Recall @0.6",        rf_06["recall"],
+     get_thr_row(xgb_sweep, 0.6)["rec"],
+     get_thr_row(lgb_sweep, 0.6)["rec"]),
+    ("F1 @0.6",            rf_06["f1"],
+     get_thr_row(xgb_sweep, 0.6)["f1"],
+     get_thr_row(lgb_sweep, 0.6)["f1"]),
+    ("% Days Up @0.6",     rf_06["pct_days_pred_up"],
+     get_thr_row(xgb_sweep, 0.6)["pct"],
+     get_thr_row(lgb_sweep, 0.6)["pct"]),
+]
+
+for label, rf_v, xgb_v, lgb_v in comparisons:
+    best = max(rf_v, xgb_v, lgb_v)
+    winner = (
+        "RF"       if rf_v  == best else
+        "XGBoost"  if xgb_v == best else
+        "LightGBM"
+    )
+    pct = label.startswith("% Days")
+    fmt = ".1%" if pct else ".4f"
+    print(
+        f"  {label:<18} {rf_v:>10{fmt}} {xgb_v:>10{fmt}} {lgb_v:>10{fmt}}  {winner:>10}"
+    )
+
+print("\n" + "="*70)
+print("VERDICT")
+print("="*70)
+best_auc   = max(rf_metrics["ROC-AUC"], xgb_m["ROC-AUC"], lgb_m["ROC-AUC"])
+best_prec6 = max(
+    rf_06["precision"],
+    get_thr_row(xgb_sweep, 0.6)["prec"],
+    get_thr_row(lgb_sweep, 0.6)["prec"],
+)
+auc_winner  = ("RF" if rf_metrics["ROC-AUC"] == best_auc else
+               "XGBoost" if xgb_m["ROC-AUC"] == best_auc else "LightGBM")
+prec_winner = ("RF" if rf_06["precision"] == best_prec6 else
+               "XGBoost" if get_thr_row(xgb_sweep, 0.6)["prec"] == best_prec6 else "LightGBM")
+
+xgb_auc_beats_rf = xgb_m["ROC-AUC"] > rf_metrics["ROC-AUC"]
+lgb_auc_beats_rf = lgb_m["ROC-AUC"] > rf_metrics["ROC-AUC"]
+xgb_prec_beats_rf = get_thr_row(xgb_sweep, 0.6)["prec"] > rf_06["precision"]
+lgb_prec_beats_rf = get_thr_row(lgb_sweep, 0.6)["prec"] > rf_06["precision"]
+
+print(f"\n  ROC-AUC  — best model: {auc_winner} ({best_auc:.4f})")
+print(f"    XGBoost  {'IMPROVES' if xgb_auc_beats_rf else 'does NOT improve'} over RF  "
+      f"(Δ={xgb_m['ROC-AUC']-rf_metrics['ROC-AUC']:+.4f})")
+print(f"    LightGBM {'IMPROVES' if lgb_auc_beats_rf else 'does NOT improve'} over RF  "
+      f"(Δ={lgb_m['ROC-AUC']-rf_metrics['ROC-AUC']:+.4f})")
+
+print(f"\n  Precision @thr=0.6 — best model: {prec_winner} ({best_prec6:.4f})")
+print(f"    XGBoost  {'IMPROVES' if xgb_prec_beats_rf else 'does NOT improve'} over RF  "
+      f"(Δ={get_thr_row(xgb_sweep,0.6)['prec']-rf_06['precision']:+.4f})")
+print(f"    LightGBM {'IMPROVES' if lgb_prec_beats_rf else 'does NOT improve'} over RF  "
+      f"(Δ={get_thr_row(lgb_sweep,0.6)['prec']-rf_06['precision']:+.4f})")

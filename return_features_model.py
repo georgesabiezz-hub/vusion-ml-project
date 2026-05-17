@@ -524,7 +524,7 @@ print("50 random combos × TimeSeriesSplit(n_splits=4), scoring=roc_auc")
 print("="*70)
 
 PARAM_DIST = {
-    "n_estimators":     randint(200, 801),       # 200–800
+    "n_estimators":     randint(200, 501),       # 200–500
     "learning_rate":    uniform(0.03, 0.07),     # 0.03–0.10
     "max_depth":        randint(3, 7),            # 3–6
     "num_leaves":       randint(15, 64),          # 15–63
@@ -532,28 +532,30 @@ PARAM_DIST = {
     "feature_fraction": uniform(0.6, 0.4),        # 0.6–1.0
 }
 
-print(f"\n50 random samples × 4 folds = 200 fits")
-print("Running search (n_jobs=-1) …\n")
+N_ITER = 30
+N_SPLITS = 4
+print(f"\n{N_ITER} random samples × {N_SPLITS} folds = {N_ITER*N_SPLITS} fits")
+print("Running search (sequential, n_jobs=1) …\n")
 
-tscv = TimeSeriesSplit(n_splits=4)
+tscv = TimeSeriesSplit(n_splits=N_SPLITS)
 
 lgb_base_for_search = lgb.LGBMClassifier(
     is_unbalance=True,
     random_state=42,
-    n_jobs=-1,
+    n_jobs=1,          # single-threaded per model — avoids joblib deadlock
     verbose=-1,
 )
 
 rand_search = RandomizedSearchCV(
     estimator=lgb_base_for_search,
     param_distributions=PARAM_DIST,
-    n_iter=50,
+    n_iter=N_ITER,
     cv=tscv,
     scoring="roc_auc",
-    n_jobs=-1,
+    n_jobs=1,          # sequential outer loop — reliable in all environments
     refit=False,
     random_state=42,
-    verbose=0,
+    verbose=1,         # show fold progress
 )
 rand_search.fit(X_tr, y_tr)
 

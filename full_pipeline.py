@@ -276,30 +276,35 @@ print("\n" + "=" * 65)
 print("STEP 4 — TARGET COLUMN")
 print("=" * 65)
 
-df["forward_ret_20"] = C.shift(-20) / C - 1
+df["forward_ret_20"] = C.shift(-20) / C - 1   # kept for reference only
 df["target_up_20"]   = (df["forward_ret_20"] > 0).astype(int)
+
+df["forward_ret_60"] = C.shift(-60) / C - 1
+df["target_up_60"]   = (df["forward_ret_60"] > 0).astype(int)
 
 # Final feature list — everything except raw prices, targets, and date
 EXCLUDE = {"Open","High","Low","Close","Adj Close","Volume",
            "mkt_close","fr_close","sec_close",
-           "forward_ret_20","target_up_20"}
+           "forward_ret_20","target_up_20",
+           "forward_ret_60","target_up_60"}
 FEATURE_COLS = [c for c in df.columns if c not in EXCLUDE]
 
-# Drop rows with any NaN in features or target (indicator warm-up + 20d lookahead)
-keep_cols = FEATURE_COLS + ["target_up_20", "forward_ret_20", "Close"]
+# Drop rows with NaN in features OR in the 60-day target (60-day lookahead tail)
+keep_cols = FEATURE_COLS + ["target_up_60", "target_up_20",
+                             "forward_ret_60", "forward_ret_20", "Close"]
 df_model  = df[keep_cols].dropna().copy()
 df_model.index = pd.to_datetime(df_model.index)
 
 print(f"  Rows after NaN drop : {len(df_model)}")
 print(f"  Feature count       : {len(FEATURE_COLS)}")
 print(f"  Date range          : {df_model.index[0].date()} → {df_model.index[-1].date()}")
-print(f"  Target balance      : {df_model['target_up_20'].mean():.1%} positive (up days)")
+print(f"  Target (60d) balance: {df_model['target_up_60'].mean():.1%} positive")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 5 — TRAIN / TEST SPLIT + LIGHTGBM
 # ─────────────────────────────────────────────────────────────────────────────
 print("\n" + "=" * 65)
-print("STEP 5 — MODEL TRAINING")
+print("STEP 5 — MODEL TRAINING  (60-day / ~3-month horizon)")
 print("=" * 65)
 
 # Time-based split: last 2 years as test
@@ -308,23 +313,25 @@ train_mask  = df_model.index <= TEST_CUTOFF
 test_mask   = df_model.index >  TEST_CUTOFF
 
 X_tr  = df_model.loc[train_mask, FEATURE_COLS].replace([np.inf,-np.inf], np.nan).fillna(0)
-y_tr  = df_model.loc[train_mask, "target_up_20"]
+y_tr  = df_model.loc[train_mask, "target_up_60"]
 X_te  = df_model.loc[test_mask,  FEATURE_COLS].replace([np.inf,-np.inf], np.nan).fillna(0)
-y_te  = df_model.loc[test_mask,  "target_up_20"]
+y_te  = df_model.loc[test_mask,  "target_up_60"]
 
+print(f"  Horizon        : 60 trading days (~3 months)")
 print(f"  Train: {X_tr.index[0].date()} → {X_tr.index[-1].date()}  ({len(X_tr)} rows)")
 print(f"  Test : {X_te.index[0].date()} → {X_te.index[-1].date()}  ({len(X_te)} rows)")
+print(f"  Test target balance: {y_te.mean():.1%} positive")
 
 model = lgb.LGBMClassifier(
     n_estimators=300,
     learning_rate=0.05,
     max_depth=4,
-    num_leaves=20,         # shallow — reduces overfitting on small dataset
-    min_data_in_leaf=50,   # require more samples per leaf
+    num_leaves=20,
+    min_data_in_leaf=50,
     feature_fraction=0.7,
     subsample=0.8,
-    reg_alpha=0.1,         # L1 regularisation
-    reg_lambda=1.0,        # L2 regularisation
+    reg_alpha=0.1,
+    reg_lambda=1.0,
     is_unbalance=True,
     random_state=42,
     n_jobs=1,
@@ -339,7 +346,7 @@ test_auc      = roc_auc_score(y_te, prob_te)
 baseline_acc  = float(y_te.mean())
 baseline_acc  = max(baseline_acc, 1 - baseline_acc)
 
-print(f"  Train ROC-AUC : {train_auc:.4f}")
+print(f"\n  Train ROC-AUC : {train_auc:.4f}")
 print(f"  Test  ROC-AUC : {test_auc:.4f}")
 print(f"  Majority-class baseline acc : {baseline_acc:.4f}")
 
@@ -351,13 +358,13 @@ for name, val in fi.head(15).items():
 
 # Attach predictions to test slice
 test_df = df_model.loc[test_mask].copy()
-test_df["prob_up_tuned"] = prob_te
+test_df["prob_up_60"] = prob_te
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 6 — BACKTEST & REPORTING
 # ─────────────────────────────────────────────────────────────────────────────
 print("\n" + "=" * 65)
-print("STEP 6 — BACKTEST & REPORTING")
+print("STEP 6 — BACKTEST & REPORTING  (60-day / ~3-month horizon)")
 print("=" * 65)
 
 THRESHOLD  = 0.70
@@ -398,7 +405,7 @@ def bh_stats(close_s):
             "sharpe": sharpe(r)}
 
 # ── 6A. EQUITY CURVE WITH COSTS ───────────────────────────────────────────────
-print("\n  6A. Equity curve (thr=0.70, cost=0.10%) …")
+print("\n  6A. Equity curve — 3-month horizon (thr=0.70, cost=0.10%) …")
 
 s    = run_strategy(test_df["Close"], prob_te, THRESHOLD, COST_BPS)
 s_nc = run_strategy(test_df["Close"], prob_te, THRESHOLD, cost=0.0)
@@ -409,24 +416,25 @@ print("  " + "-" * 55)
 for k, label in [("total_return","Total return"),("max_drawdown","Max drawdown"),
                   ("sharpe","Sharpe ratio")]:
     fmt = ".1%" if k != "sharpe" else ".3f"
-    bh_v  = bh[k]
-    nc_v  = s_nc[k]
-    c_v   = s[k]
-    print(f"  {label:<22} {bh_v:>10{fmt}} {nc_v:>10{fmt}} {c_v:>10{fmt}}")
+    print(f"  {label:<22} {bh[k]:>10{fmt}} {s_nc[k]:>10{fmt}} {s[k]:>10{fmt}}")
 print(f"  {'Num trades':<22} {'—':>10} {s['n_trades']:>10} {s['n_trades']:>10}")
 
 fig1, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7),
                                  gridspec_kw={"height_ratios": [3, 1]})
-ax1.plot(test_df.index, bh["equity"],   label=f"Buy & Hold ({bh['total_return']:+.1%})",
+ax1.plot(test_df.index, bh["equity"],
+         label=f"Buy & Hold ({bh['total_return']:+.1%})",
          color="steelblue", lw=1.8)
-ax1.plot(test_df.index, s_nc["equity"], label=f"Strategy no cost ({s_nc['total_return']:+.1%})",
+ax1.plot(test_df.index, s_nc["equity"],
+         label=f"3-month LGB, no cost ({s_nc['total_return']:+.1%})",
          color="forestgreen", lw=1.5, linestyle="--")
-ax1.plot(test_df.index, s["equity"],    label=f"Strategy 0.10% cost ({s['total_return']:+.1%})",
+ax1.plot(test_df.index, s["equity"],
+         label=f"3-month LGB, 0.10% cost ({s['total_return']:+.1%})",
          color="tomato", lw=1.8)
 ax1.axhline(1, color="grey", lw=0.7, linestyle=":"); ax1.grid(alpha=0.3)
 ax1.set_ylabel("Equity (start=1.0)")
-ax1.set_title(f"VU.PA — LightGBM Strategy vs Buy & Hold  [{DATA_SOURCE}]",
-              fontsize=11, fontweight="bold")
+ax1.set_title(
+    f"VU.PA — LightGBM 3-Month (60-Day) Strategy vs Buy & Hold  [{DATA_SOURCE}]",
+    fontsize=11, fontweight="bold")
 ax1.legend(fontsize=9)
 ax2.fill_between(test_df.index, s["position"], step="pre",
                  color="tomato", alpha=0.45, label="Long")
@@ -434,11 +442,11 @@ ax2.set_yticks([0,1]); ax2.set_yticklabels(["Cash","Long"])
 ax2.set_ylabel("Position"); ax2.set_xlabel("Date")
 ax2.legend(fontsize=9); ax2.grid(alpha=0.3)
 plt.tight_layout()
-plt.savefig("equity_curve_v2.png", dpi=150, bbox_inches="tight")
-print("  → equity_curve_v2.png")
+plt.savefig("equity_curve_60d.png", dpi=150, bbox_inches="tight")
+print("  → equity_curve_60d.png")
 
 # ── 6B. THRESHOLD ROBUSTNESS SWEEP ───────────────────────────────────────────
-print("\n  6B. Threshold robustness sweep (0.50 → 0.80) …")
+print("\n  6B. Threshold robustness sweep — 3-month horizon (0.50 → 0.80) …")
 
 thr_vals = np.arange(0.50, 0.81, 0.05)
 thr_rows = []
@@ -465,7 +473,7 @@ for _, r in thr_df.iterrows():
 
 # 4-panel plot
 fig2, axes = plt.subplots(2, 2, figsize=(12, 8))
-fig2.suptitle(f"Threshold Robustness  [{DATA_SOURCE}]",
+fig2.suptitle(f"Threshold Robustness — 3-Month (60-Day) Horizon  [{DATA_SOURCE}]",
               fontsize=12, fontweight="bold")
 panels = [
     (axes[0,0], "total_return",  "Total Return (%)",       True),
@@ -487,16 +495,16 @@ for ax, col, ylabel, as_pct in panels:
     ax.set_xticks(thr_df["threshold"])
     ax.set_xticklabels([f"{t:.2f}" for t in thr_df["threshold"]], fontsize=8)
 plt.tight_layout()
-plt.savefig("threshold_robustness_v2.png", dpi=150, bbox_inches="tight")
-print("  → threshold_robustness_v2.png")
+plt.savefig("threshold_robustness_60d.png", dpi=150, bbox_inches="tight")
+print("  → threshold_robustness_60d.png")
 
 # ── 6C. WALK-FORWARD VALIDATION ───────────────────────────────────────────────
-print("\n  6C. Walk-forward validation …")
+print("\n  6C. Walk-forward validation — 3-month horizon …")
 
 TEST_BLOCK = 250
 MIN_TRAIN  = 600
 X_all = df_model[FEATURE_COLS].replace([np.inf,-np.inf], np.nan).fillna(0)
-y_all = df_model["target_up_20"]
+y_all = df_model["target_up_60"]
 close_all = df_model["Close"]
 dates_all = df_model.index
 
@@ -559,8 +567,10 @@ print(f"\n  Strategy beat B&H in {wins}/{len(wf_df)} windows")
 
 # Walk-forward 3-panel plot
 fig3, axes3 = plt.subplots(1, 3, figsize=(14, 4))
-fig3.suptitle(f"Walk-Forward Results (thr={THRESHOLD}, cost=0.10%)  [{DATA_SOURCE}]",
-              fontsize=11, fontweight="bold")
+fig3.suptitle(
+    f"Walk-Forward Results — 3-Month (60-Day) Horizon  (thr={THRESHOLD}, cost=0.10%)"
+    f"  [{DATA_SOURCE}]",
+    fontsize=10, fontweight="bold")
 wf_wins = wf_df["window"]
 for ax, col, title, is_pct in [
     (axes3[0], "strat_ret",    "Total Return",  True),
@@ -580,23 +590,24 @@ for ax, col, title, is_pct in [
     unit = "%" if is_pct else ""
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0f}{unit}"))
 plt.tight_layout()
-plt.savefig("walkforward_v2.png", dpi=150, bbox_inches="tight")
-print("  → walkforward_v2.png")
+plt.savefig("walkforward_60d.png", dpi=150, bbox_inches="tight")
+print("  → walkforward_60d.png")
 
 # ── 6D. SAVE FULL FEATURE + PREDICTION CSV ────────────────────────────────────
 out = df_model.copy()
-out["prob_up_tuned"] = np.nan
-out.loc[test_mask, "prob_up_tuned"] = prob_te
-out["is_test"] = test_mask.astype(int)
+out["prob_up_60"]  = np.nan
+out.loc[test_mask, "prob_up_60"] = prob_te
+out["is_test"]     = test_mask.astype(int)
 out["data_source"] = DATA_SOURCE
-out.to_csv("vu_pa_full_pipeline.csv")
-print(f"\n  → vu_pa_full_pipeline.csv  ({len(out)} rows, {len(out.columns)} cols)")
+out.to_csv("vu_pa_full_pipeline_60d.csv")
+print(f"\n  → vu_pa_full_pipeline_60d.csv  ({len(out)} rows, {len(out.columns)} cols)")
 
 print("\n" + "=" * 65)
 print("DONE")
 print("=" * 65)
+print(f"  Horizon       : 60 trading days (~3 months)")
 print(f"  Features      : {len(FEATURE_COLS)}")
 print(f"  Test AUC      : {test_auc:.4f}")
 print(f"  Data source   : {DATA_SOURCE}")
-print(f"  Outputs       : equity_curve_v2.png  threshold_robustness_v2.png")
-print(f"                  walkforward_v2.png   vu_pa_full_pipeline.csv")
+print(f"  Outputs       : equity_curve_60d.png  threshold_robustness_60d.png")
+print(f"                  walkforward_60d.png   vu_pa_full_pipeline_60d.csv")

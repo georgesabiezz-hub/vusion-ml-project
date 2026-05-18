@@ -368,7 +368,8 @@ print("STEP 6 — BACKTEST & REPORTING  (60-day / ~3-month horizon)")
 print("=" * 65)
 
 THRESHOLD  = 0.70
-COST_BPS   = 0.001    # 0.10% per position change
+STRICT_THR = 0.65    # threshold used for prob-only and strict strategy
+COST_BPS   = 0.001   # 0.10% per position change
 
 # ── shared helpers ────────────────────────────────────────────────────────────
 def max_dd(eq):
@@ -377,23 +378,32 @@ def max_dd(eq):
 def sharpe(r):
     return (r.mean() / r.std() * np.sqrt(252)) if r.std() > 0 else 0.0
 
-def run_strategy(close_s, probs, thr, cost=0.0):
-    pos       = pd.Series((probs >= thr).astype(float), index=close_s.index)
+def run_strategy(close_s, probs, thr, cost=0.0, signal_mask=None):
+    """
+    signal_mask: optional boolean/0-1 Series aligned to close_s index.
+    When provided, position = (prob >= thr) AND mask (logical AND).
+    """
+    pos = pd.Series((probs >= thr).astype(float), index=close_s.index)
+    if signal_mask is not None:
+        mask = pd.Series(signal_mask.values if hasattr(signal_mask, "values")
+                         else signal_mask,
+                         index=close_s.index, dtype=float)
+        pos  = (pos * mask).clip(0, 1)
     ret_stock = close_s.pct_change().fillna(0.0)
     ret_strat = pos.shift(1).fillna(0) * ret_stock
     trades    = pos.diff().abs().fillna(0)
     ret_strat -= trades * cost
     eq        = (1 + ret_strat).cumprod()
     return {
-        "ret_strat":    ret_strat,
-        "equity":       eq,
-        "position":     pos,
-        "total_return": eq.iloc[-1] - 1,
-        "max_drawdown": max_dd(eq),
-        "sharpe":       sharpe(ret_strat),
-        "days_invested":int(pos.sum()),
-        "invested_pct": pos.mean(),
-        "n_trades":     int(trades.sum()),
+        "ret_strat":     ret_strat,
+        "equity":        eq,
+        "position":      pos,
+        "total_return":  eq.iloc[-1] - 1,
+        "max_drawdown":  max_dd(eq),
+        "sharpe":        sharpe(ret_strat),
+        "days_invested": int(pos.sum()),
+        "invested_pct":  pos.mean(),
+        "n_trades":      int(trades.sum()),
     }
 
 def bh_stats(close_s):
@@ -503,10 +513,16 @@ print("\n  6C. Walk-forward validation — 3-month horizon …")
 
 TEST_BLOCK = 250
 MIN_TRAIN  = 600
-X_all = df_model[FEATURE_COLS].replace([np.inf,-np.inf], np.nan).fillna(0)
-y_all = df_model["target_up_60"]
-close_all = df_model["Close"]
-dates_all = df_model.index
+X_all       = df_model[FEATURE_COLS].replace([np.inf,-np.inf], np.nan).fillna(0)
+y_all       = df_model["target_up_60"]
+close_all   = df_model["Close"]
+dates_all   = df_model.index
+
+# Strict-filter mask for entire model dataset (no look-ahead — both cols are past-only)
+strict_mask_all = (
+    (df_model["stock_above_200dma"] == 1) &
+    (df_model["rel_vs_mkt_60d"]     >  0)
+).astype(float)
 
 wf_rows = []
 train_end = MIN_TRAIN
@@ -523,27 +539,38 @@ while train_end + TEST_BLOCK <= len(df_model):
         is_unbalance=True, random_state=42, n_jobs=1, verbose=-1,
     )
     wf_m.fit(X_all.iloc[:ts], y_all.iloc[:ts])
-    wf_probs = wf_m.predict_proba(X_all.iloc[ts:te])[:, 1]
-    wf_close = close_all.iloc[ts:te]
+    wf_probs  = wf_m.predict_proba(X_all.iloc[ts:te])[:, 1]
+    wf_close  = close_all.iloc[ts:te]
+    wf_smask  = strict_mask_all.iloc[ts:te]
 
-    strat = run_strategy(wf_close, wf_probs, THRESHOLD, COST_BPS)
-    bh_w  = bh_stats(wf_close)
+    strat  = run_strategy(wf_close, wf_probs, THRESHOLD,  COST_BPS)
+    strict = run_strategy(wf_close, wf_probs, STRICT_THR, COST_BPS,
+                          signal_mask=wf_smask)
+    bh_w   = bh_stats(wf_close)
 
     wf_rows.append({
-        "window":       wnum,
-        "train_end":    dates_all[ts-1].date(),
-        "test_start":   dates_all[ts].date(),
-        "test_end":     dates_all[te-1].date(),
-        "strat_ret":    strat["total_return"],
-        "bh_ret":       bh_w["total_return"],
-        "excess":       strat["total_return"] - bh_w["total_return"],
-        "max_drawdown": strat["max_drawdown"],
-        "sharpe":       strat["sharpe"],
-        "invested_pct": strat["invested_pct"],
+        "window":          wnum,
+        "train_end":       dates_all[ts-1].date(),
+        "test_start":      dates_all[ts].date(),
+        "test_end":        dates_all[te-1].date(),
+        "strat_ret":       strat["total_return"],
+        "bh_ret":          bh_w["total_return"],
+        "excess":          strat["total_return"] - bh_w["total_return"],
+        "max_drawdown":    strat["max_drawdown"],
+        "sharpe":          strat["sharpe"],
+        "invested_pct":    strat["invested_pct"],
+        "strict_ret":      strict["total_return"],
+        "strict_excess":   strict["total_return"] - bh_w["total_return"],
+        "strict_mdd":      strict["max_drawdown"],
+        "strict_sharpe":   strict["sharpe"],
+        "strict_inv_pct":  strict["invested_pct"],
+        "strict_trades":   strict["n_trades"],
     })
     train_end += TEST_BLOCK
 
 wf_df = pd.DataFrame(wf_rows)
+
+# ── original strategy table ───────────────────────────────────────────────────
 hdr = (f"  {'W':>2}  {'Train end':>11}  {'Test start':>11}  {'Test end':>11}"
        f"  {'Ret':>7}  {'B&H':>7}  {'Excess':>7}  {'MDD':>7}  {'Sharpe':>6}  {'%Inv':>5}")
 print(hdr); print("  " + "-"*(len(hdr)-2))
@@ -553,7 +580,6 @@ for _, r in wf_df.iterrows():
           f"  {r['strat_ret']:>+7.1%}  {r['bh_ret']:>+7.1%}"
           f"  {r['excess']:>+7.1%}  {r['max_drawdown']:>7.1%}"
           f"  {r['sharpe']:>6.3f}  {r['invested_pct']:>4.0%}")
-
 print("  " + "-"*(len(hdr)-2))
 for lab, fn in [("Mean  ", wf_df.mean), ("Median", wf_df.median)]:
     a = fn(numeric_only=True)
@@ -561,11 +587,10 @@ for lab, fn in [("Mean  ", wf_df.mean), ("Median", wf_df.median)]:
           f"  {a['strat_ret']:>+7.1%}  {a['bh_ret']:>+7.1%}"
           f"  {a['excess']:>+7.1%}  {a['max_drawdown']:>7.1%}"
           f"  {a['sharpe']:>6.3f}  {a['invested_pct']:>4.0%}")
-
 wins = (wf_df["excess"] > 0).sum()
 print(f"\n  Strategy beat B&H in {wins}/{len(wf_df)} windows")
 
-# Walk-forward 3-panel plot
+# Walk-forward 3-panel plot (original strategy)
 fig3, axes3 = plt.subplots(1, 3, figsize=(14, 4))
 fig3.suptitle(
     f"Walk-Forward Results — 3-Month (60-Day) Horizon  (thr={THRESHOLD}, cost=0.10%)"
@@ -593,7 +618,118 @@ plt.tight_layout()
 plt.savefig("walkforward_60d.png", dpi=150, bbox_inches="tight")
 print("  → walkforward_60d.png")
 
-# ── 6D. SAVE FULL FEATURE + PREDICTION CSV ────────────────────────────────────
+# ── 6D. STRICT STRATEGY — test set ───────────────────────────────────────────
+print("\n  6D. Strict-filter strategy (prob≥0.65 + above 200dma + outperform mkt) …")
+
+strict_mask_te = (
+    (test_df["stock_above_200dma"] == 1) &
+    (test_df["rel_vs_mkt_60d"]     >  0)
+).astype(float)
+
+s_prob65 = run_strategy(test_df["Close"], prob_te, STRICT_THR, COST_BPS)
+s_strict = run_strategy(test_df["Close"], prob_te, STRICT_THR, COST_BPS,
+                        signal_mask=strict_mask_te)
+
+print(f"\n  {'Metric':<24} {'Buy&Hold':>10} {'Prob≥0.65':>10} {'Strict':>10}")
+print("  " + "-" * 57)
+for k, label in [("total_return", "Total return"),
+                  ("max_drawdown", "Max drawdown"),
+                  ("sharpe",       "Sharpe ratio")]:
+    fmt = ".1%" if k != "sharpe" else ".3f"
+    print(f"  {label:<24} {bh[k]:>10{fmt}} {s_prob65[k]:>10{fmt}} {s_strict[k]:>10{fmt}}")
+print(f"  {'Num trades':<24} {'—':>10} {s_prob65['n_trades']:>10} {s_strict['n_trades']:>10}")
+print(f"  {'% days invested':<24} {'100%':>10} {s_prob65['invested_pct']:>10.1%} "
+      f"{s_strict['invested_pct']:>10.1%}")
+
+# Equity curve: 3 lines — B&H, prob-only 0.65, strict
+fig4, (ax41, ax42) = plt.subplots(2, 1, figsize=(12, 7),
+                                   gridspec_kw={"height_ratios": [3, 1]})
+ax41.plot(test_df.index, bh["equity"],
+          label=f"Buy & Hold ({bh['total_return']:+.1%})",
+          color="steelblue", lw=2.0)
+ax41.plot(test_df.index, s_prob65["equity"],
+          label=f"Prob ≥ 0.65 only ({s_prob65['total_return']:+.1%})",
+          color="forestgreen", lw=1.6, linestyle="--")
+ax41.plot(test_df.index, s_strict["equity"],
+          label=f"Strict: prob≥0.65 + above 200dma + outperform mkt ({s_strict['total_return']:+.1%})",
+          color="tomato", lw=2.0)
+ax41.axhline(1, color="grey", lw=0.7, linestyle=":")
+ax41.grid(alpha=0.3)
+ax41.set_ylabel("Equity (start = 1.0)")
+ax41.set_title(
+    f"VU.PA — Strict Strategy vs Prob-Only vs Buy & Hold  [{DATA_SOURCE}]",
+    fontsize=11, fontweight="bold")
+ax41.legend(fontsize=9)
+
+# Position panel: prob-only fill underneath, strict fill on top (strict ⊆ prob-only)
+ax42.fill_between(test_df.index, s_prob65["position"], step="pre",
+                  color="forestgreen", alpha=0.30, label=f"Prob≥0.65 ({s_prob65['invested_pct']:.0%})")
+ax42.fill_between(test_df.index, s_strict["position"], step="pre",
+                  color="tomato",      alpha=0.60, label=f"Strict ({s_strict['invested_pct']:.0%})")
+ax42.set_yticks([0, 1]); ax42.set_yticklabels(["Cash", "Long"])
+ax42.set_ylabel("Position"); ax42.set_xlabel("Date")
+ax42.legend(fontsize=9); ax42.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("equity_curve_strict_60d.png", dpi=150, bbox_inches="tight")
+print("  → equity_curve_strict_60d.png")
+
+# Walk-forward strict comparison table
+print(f"\n  Walk-forward — Strict vs Prob≥0.65 vs B&H:")
+hdr2 = (f"  {'W':>2}  {'Train end':>11}  {'Test start':>11}  {'Test end':>11}"
+        f"  {'Strict':>8}  {'Prob65':>8}  {'B&H':>8}  {'ExcS':>8}"
+        f"  {'MDD_S':>7}  {'Sh_S':>6}  {'%Inv_S':>6}  {'#Tr':>5}")
+print(hdr2); print("  " + "-"*(len(hdr2)-2))
+for _, r in wf_df.iterrows():
+    print(f"  {int(r['window']):>2}  {str(r['train_end']):>11}  "
+          f"{str(r['test_start']):>11}  {str(r['test_end']):>11}"
+          f"  {r['strict_ret']:>+8.1%}  {r['strat_ret']:>+8.1%}"
+          f"  {r['bh_ret']:>+8.1%}  {r['strict_excess']:>+8.1%}"
+          f"  {r['strict_mdd']:>7.1%}  {r['strict_sharpe']:>6.3f}"
+          f"  {r['strict_inv_pct']:>6.0%}  {int(r['strict_trades']):>5}")
+print("  " + "-"*(len(hdr2)-2))
+for lab, fn in [("Mean  ", wf_df.mean), ("Median", wf_df.median)]:
+    a = fn(numeric_only=True)
+    print(f"  {lab}                             "
+          f"  {a['strict_ret']:>+8.1%}  {a['strat_ret']:>+8.1%}"
+          f"  {a['bh_ret']:>+8.1%}  {a['strict_excess']:>+8.1%}"
+          f"  {a['strict_mdd']:>7.1%}  {a['strict_sharpe']:>6.3f}"
+          f"  {a['strict_inv_pct']:>6.0%}  {a['strict_trades']:>5.1f}")
+strict_wins = (wf_df["strict_excess"] > 0).sum()
+print(f"\n  Strict strategy beat B&H in {strict_wins}/{len(wf_df)} windows")
+
+# Walk-forward strict comparison — grouped bar chart
+fig5, axes5 = plt.subplots(1, 3, figsize=(14, 4))
+fig5.suptitle(
+    f"Walk-Forward — Strict vs Prob≥0.65 vs B&H  (60-Day Horizon, cost=0.10%)"
+    f"  [{DATA_SOURCE}]",
+    fontsize=10, fontweight="bold")
+bar_w = 0.28
+x = np.arange(len(wf_df))
+for ax, s_col, p_col, title, is_pct in [
+    (axes5[0], "strict_ret",    "strat_ret",    "Total Return",  True),
+    (axes5[1], "strict_mdd",    "max_drawdown", "Max Drawdown",  True),
+    (axes5[2], "strict_sharpe", "sharpe",       "Sharpe Ratio",  False),
+]:
+    scale = 100 if is_pct else 1
+    sv = wf_df[s_col].values * scale
+    pv = wf_df[p_col].values * scale
+    bv = wf_df["bh_ret"].values * scale if is_pct else np.zeros(len(wf_df))
+
+    ax.bar(x - bar_w, sv, width=bar_w, color="tomato",      alpha=0.85, label="Strict",    edgecolor="white")
+    ax.bar(x,         pv, width=bar_w, color="forestgreen", alpha=0.85, label="Prob≥0.65", edgecolor="white")
+    if is_pct and title == "Total Return":
+        ax.bar(x + bar_w, bv, width=bar_w, color="steelblue",   alpha=0.60, label="B&H",  edgecolor="white")
+    ax.axhline(0, color="grey", lw=0.8)
+    ax.set_xlabel("Window"); ax.set_title(title); ax.grid(axis="y", alpha=0.3)
+    ax.set_xticks(x); ax.set_xticklabels(wf_df["window"])
+    unit = "%" if is_pct else ""
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}{unit}"))
+    ax.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig("walkforward_strict_60d.png", dpi=150, bbox_inches="tight")
+print("  → walkforward_strict_60d.png")
+
+# ── 6E. SAVE FULL FEATURE + PREDICTION CSV ────────────────────────────────────
 out = df_model.copy()
 out["prob_up_60"]  = np.nan
 out.loc[test_mask, "prob_up_60"] = prob_te
@@ -609,5 +745,6 @@ print(f"  Horizon       : 60 trading days (~3 months)")
 print(f"  Features      : {len(FEATURE_COLS)}")
 print(f"  Test AUC      : {test_auc:.4f}")
 print(f"  Data source   : {DATA_SOURCE}")
-print(f"  Outputs       : equity_curve_60d.png  threshold_robustness_60d.png")
-print(f"                  walkforward_60d.png   vu_pa_full_pipeline_60d.csv")
+print(f"  Outputs       : equity_curve_60d.png          threshold_robustness_60d.png")
+print(f"                  equity_curve_strict_60d.png  walkforward_60d.png")
+print(f"                  walkforward_strict_60d.png   vu_pa_full_pipeline_60d.csv")

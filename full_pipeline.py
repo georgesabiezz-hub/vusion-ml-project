@@ -199,6 +199,7 @@ df["dist_ema50"]  = C / _ema50 - 1
 df["ma5_vs_ma20"]   = _ma5  / _ma20  - 1
 df["ma20_vs_ma50"]  = _ma20 / _ma50  - 1
 df["ma50_vs_ma200"] = _ma50 / _ma200 - 1
+df["ma20_vs_ma200"] = _ma20 / _ma200 - 1   # intermediate vs long-term trend
 
 # RSI-14
 _d  = C.diff()
@@ -251,10 +252,12 @@ print("  C. Liquidity & risk …")
 df["vol_20d_avg"]    = df["Volume"].rolling(20).mean()
 df["euro_vol_20d"]   = (Cl * df["Volume"]).rolling(20).mean()
 df["vu_vol_20d"]     = roll_std(df["ret_1d"], 20)       # VU.PA 20d return vol
+df["vol_60d_vu"]     = roll_std(df["ret_1d"], 60)       # VU.PA 60d return vol
 df["mkt_vol_20d"]    = roll_std(df["ret_1d_mkt"], 20)   # market 20d return vol
 df["vol_change_1d"]  = df["Volume"] / df["Volume"].shift(1) - 1
 df["vol_zscore_20"]  = ((df["Volume"] - df["vol_20d_avg"])
                          / roll_std(df["Volume"], 20).replace(0, np.nan))
+df["vol_vs_avg_20d"] = df["Volume"] / df["vol_20d_avg"].replace(0, np.nan)
 
 # ── D. REGIME FLAGS ───────────────────────────────────────────────────────────
 print("  D. Regime flags …")
@@ -268,6 +271,20 @@ mkt_vol_median              = df["mkt_vol_20d"].expanding().median()
 df["high_vol_regime"]       = (df["mkt_vol_20d"] > mkt_vol_median).astype(int)
 
 # (dist_ma50 already captures close vs 50dma in ratio form)
+
+# ── E. VOLATILITY-SCALED FEATURES ────────────────────────────────────────────
+# Dividing returns by realised vol makes them comparable across calm vs turbulent
+# regimes and reduces heteroskedasticity.
+print("  E. Volatility-scaled features …")
+
+_vol20 = df["vu_vol_20d"].replace(0, np.nan)
+_vol60 = df["vol_60d_vu"].replace(0, np.nan)
+
+df["ret_5d_scaled_vu"]      = df["ret_5d"]          / _vol20
+df["ret_20d_scaled_vu"]     = df["ret_20d"]         / _vol20
+df["ret_60d_scaled_vu"]     = df["ret_60d"]         / _vol60
+df["rel_vs_mkt_20d_scaled"] = df["rel_vs_mkt_20d"]  / _vol20
+df["rel_vs_mkt_60d_scaled"] = df["rel_vs_mkt_60d"]  / _vol60
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 — TARGET COLUMN
@@ -289,6 +306,27 @@ EXCLUDE = {"Open","High","Low","Close","Adj Close","Volume",
            "forward_ret_60","target_up_60"}
 FEATURE_COLS = [c for c in df.columns if c not in EXCLUDE]
 
+# Core documented feature subset — one or two per category.
+# All KEY_FEATURES are included in FEATURE_COLS; the model uses all of FEATURE_COLS.
+KEY_FEATURES = [
+    # Momentum
+    "ret_60d", "rsi_14",
+    # Trend
+    "dist_ma200", "ma20_vs_ma200",
+    # Volatility
+    "vu_vol_20d", "bb_width_20",
+    # Volume
+    "vol_20d_avg", "vol_vs_avg_20d",
+    # Relative strength
+    "rel_vs_mkt_60d", "rel_vs_sec_60d",
+    # Volatility-scaled
+    "ret_5d_scaled_vu", "ret_20d_scaled_vu", "ret_60d_scaled_vu",
+    "rel_vs_mkt_20d_scaled", "rel_vs_mkt_60d_scaled",
+]
+assert all(f in FEATURE_COLS for f in KEY_FEATURES), \
+    f"KEY_FEATURES contains column(s) not in FEATURE_COLS: " \
+    f"{[f for f in KEY_FEATURES if f not in FEATURE_COLS]}"
+
 # Drop rows with NaN in features OR in the 60-day target (60-day lookahead tail)
 keep_cols = FEATURE_COLS + ["target_up_60", "target_up_20",
                              "forward_ret_60", "forward_ret_20", "Close"]
@@ -296,9 +334,10 @@ df_model  = df[keep_cols].dropna().copy()
 df_model.index = pd.to_datetime(df_model.index)
 
 print(f"  Rows after NaN drop : {len(df_model)}")
-print(f"  Feature count       : {len(FEATURE_COLS)}")
+print(f"  Feature count       : {len(FEATURE_COLS)}  (key subset: {len(KEY_FEATURES)})")
 print(f"  Date range          : {df_model.index[0].date()} → {df_model.index[-1].date()}")
 print(f"  Target (60d) balance: {df_model['target_up_60'].mean():.1%} positive")
+print(f"  KEY_FEATURES        : {', '.join(KEY_FEATURES)}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 5 — TRAIN / TEST SPLIT + LIGHTGBM
@@ -307,17 +346,26 @@ print("\n" + "=" * 65)
 print("STEP 5 — MODEL TRAINING  (60-day / ~3-month horizon)")
 print("=" * 65)
 
-# Time-based split: last 2 years as test
-TEST_CUTOFF = df_model.index.max() - pd.DateOffset(years=2)
-train_mask  = df_model.index <= TEST_CUTOFF
-test_mask   = df_model.index >  TEST_CUTOFF
+# 1-day feature lag: features at row T carry values from T-1.
+# Targets stay at T ("is 60d return from T positive?").
+# This models: "using close T-1 information, predict [T → T+60]."
+X_lagged     = df_model[FEATURE_COLS].shift(1)
+df_model_fit = df_model.copy()
+df_model_fit[FEATURE_COLS] = X_lagged
+df_model_fit = df_model_fit.iloc[1:].copy()  # drop row 0 (all-NaN features after shift)
 
-X_tr  = df_model.loc[train_mask, FEATURE_COLS].replace([np.inf,-np.inf], np.nan).fillna(0)
-y_tr  = df_model.loc[train_mask, "target_up_60"]
-X_te  = df_model.loc[test_mask,  FEATURE_COLS].replace([np.inf,-np.inf], np.nan).fillna(0)
-y_te  = df_model.loc[test_mask,  "target_up_60"]
+# Time-based split: last 2 years as test
+TEST_CUTOFF = df_model_fit.index.max() - pd.DateOffset(years=2)
+train_mask  = df_model_fit.index <= TEST_CUTOFF
+test_mask   = df_model_fit.index >  TEST_CUTOFF
+
+X_tr  = df_model_fit.loc[train_mask, FEATURE_COLS].replace([np.inf,-np.inf], np.nan).fillna(0)
+y_tr  = df_model_fit.loc[train_mask, "target_up_60"]
+X_te  = df_model_fit.loc[test_mask,  FEATURE_COLS].replace([np.inf,-np.inf], np.nan).fillna(0)
+y_te  = df_model_fit.loc[test_mask,  "target_up_60"]
 
 print(f"  Horizon        : 60 trading days (~3 months)")
+print(f"  Feature lag    : 1 day  (features from T-1 predict return from T → T+60)")
 print(f"  Train: {X_tr.index[0].date()} → {X_tr.index[-1].date()}  ({len(X_tr)} rows)")
 print(f"  Test : {X_te.index[0].date()} → {X_te.index[-1].date()}  ({len(X_te)} rows)")
 print(f"  Test target balance: {y_te.mean():.1%} positive")
@@ -356,8 +404,8 @@ print(f"\n  Top 15 features by importance:")
 for name, val in fi.head(15).items():
     print(f"    {name:<30} {val:>6.0f}")
 
-# Attach predictions to test slice
-test_df = df_model.loc[test_mask].copy()
+# Attach predictions to test slice (lagged-feature version)
+test_df = df_model_fit.loc[test_mask].copy()
 test_df["prob_up_60"] = prob_te
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -414,40 +462,45 @@ def bh_stats(close_s):
             "max_drawdown": max_dd(eq),
             "sharpe": sharpe(r)}
 
-# ── 6A. EQUITY CURVE WITH COSTS ───────────────────────────────────────────────
-print("\n  6A. Equity curve — 3-month horizon (thr=0.70, cost=0.10%) …")
+# ── 6A. EQUITY CURVE — thr=0.65 vs thr=0.70 (cost=0.10%) ────────────────────
+print("\n  6A. Equity curve — thr=0.65 vs thr=0.70 (cost=0.10%) …")
 
-s    = run_strategy(test_df["Close"], prob_te, THRESHOLD, COST_BPS)
-s_nc = run_strategy(test_df["Close"], prob_te, THRESHOLD, cost=0.0)
-bh   = bh_stats(test_df["Close"])
+bh  = bh_stats(test_df["Close"])
+s65 = run_strategy(test_df["Close"], prob_te, 0.65, COST_BPS)
+s70 = run_strategy(test_df["Close"], prob_te, 0.70, COST_BPS)
 
-print(f"\n  {'Metric':<22} {'Buy&Hold':>10} {'No cost':>10} {'0.10% cost':>10}")
+print(f"\n  {'Metric':<22} {'Buy&Hold':>10} {'Thr=0.65':>10} {'Thr=0.70':>10}")
 print("  " + "-" * 55)
 for k, label in [("total_return","Total return"),("max_drawdown","Max drawdown"),
                   ("sharpe","Sharpe ratio")]:
     fmt = ".1%" if k != "sharpe" else ".3f"
-    print(f"  {label:<22} {bh[k]:>10{fmt}} {s_nc[k]:>10{fmt}} {s[k]:>10{fmt}}")
-print(f"  {'Num trades':<22} {'—':>10} {s['n_trades']:>10} {s['n_trades']:>10}")
+    print(f"  {label:<22} {bh[k]:>10{fmt}} {s65[k]:>10{fmt}} {s70[k]:>10{fmt}}")
+print(f"  {'Num trades':<22} {'—':>10} {s65['n_trades']:>10} {s70['n_trades']:>10}")
+print(f"  {'% days invested':<22} {'100%':>10} {s65['invested_pct']:>10.1%} {s70['invested_pct']:>10.1%}")
 
 fig1, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7),
                                  gridspec_kw={"height_ratios": [3, 1]})
 ax1.plot(test_df.index, bh["equity"],
          label=f"Buy & Hold ({bh['total_return']:+.1%})",
-         color="steelblue", lw=1.8)
-ax1.plot(test_df.index, s_nc["equity"],
-         label=f"3-month LGB, no cost ({s_nc['total_return']:+.1%})",
-         color="forestgreen", lw=1.5, linestyle="--")
-ax1.plot(test_df.index, s["equity"],
-         label=f"3-month LGB, 0.10% cost ({s['total_return']:+.1%})",
+         color="steelblue", lw=2.0)
+ax1.plot(test_df.index, s65["equity"],
+         label=f"LGB thr=0.65 ({s65['total_return']:+.1%})",
+         color="forestgreen", lw=1.8, linestyle="--")
+ax1.plot(test_df.index, s70["equity"],
+         label=f"LGB thr=0.70 ({s70['total_return']:+.1%})",
          color="tomato", lw=1.8)
 ax1.axhline(1, color="grey", lw=0.7, linestyle=":"); ax1.grid(alpha=0.3)
 ax1.set_ylabel("Equity (start=1.0)")
 ax1.set_title(
-    f"VU.PA — LightGBM 3-Month (60-Day) Strategy vs Buy & Hold  [{DATA_SOURCE}]",
+    f"VU.PA — LightGBM 3-Month Strategy: thr=0.65 vs thr=0.70  [{DATA_SOURCE}]",
     fontsize=11, fontweight="bold")
 ax1.legend(fontsize=9)
-ax2.fill_between(test_df.index, s["position"], step="pre",
-                 color="tomato", alpha=0.45, label="Long")
+ax2.fill_between(test_df.index, s65["position"], step="pre",
+                 color="forestgreen", alpha=0.30,
+                 label=f"Thr=0.65 ({s65['invested_pct']:.0%})")
+ax2.fill_between(test_df.index, s70["position"], step="pre",
+                 color="tomato", alpha=0.55,
+                 label=f"Thr=0.70 ({s70['invested_pct']:.0%})")
 ax2.set_yticks([0,1]); ax2.set_yticklabels(["Cash","Long"])
 ax2.set_ylabel("Position"); ax2.set_xlabel("Date")
 ax2.legend(fontsize=9); ax2.grid(alpha=0.3)
@@ -513,21 +566,21 @@ print("\n  6C. Walk-forward validation — 3-month horizon …")
 
 TEST_BLOCK = 250
 MIN_TRAIN  = 600
-X_all       = df_model[FEATURE_COLS].replace([np.inf,-np.inf], np.nan).fillna(0)
-y_all       = df_model["target_up_60"]
-close_all   = df_model["Close"]
-dates_all   = df_model.index
+X_all       = df_model_fit[FEATURE_COLS].replace([np.inf,-np.inf], np.nan).fillna(0)
+y_all       = df_model_fit["target_up_60"]
+close_all   = df_model_fit["Close"]
+dates_all   = df_model_fit.index
 
-# Strict-filter mask for entire model dataset (no look-ahead — both cols are past-only)
+# Strict-filter mask — uses lagged feature values (already in df_model_fit)
 strict_mask_all = (
-    (df_model["stock_above_200dma"] == 1) &
-    (df_model["rel_vs_mkt_60d"]     >  0)
+    (df_model_fit["stock_above_200dma"] == 1) &
+    (df_model_fit["rel_vs_mkt_60d"]     >  0)
 ).astype(float)
 
 wf_rows = []
 train_end = MIN_TRAIN
 wnum = 0
-while train_end + TEST_BLOCK <= len(df_model):
+while train_end + TEST_BLOCK <= len(df_model_fit):
     ts  = train_end
     te  = min(train_end + TEST_BLOCK, len(df_model))
     wnum += 1
@@ -543,22 +596,28 @@ while train_end + TEST_BLOCK <= len(df_model):
     wf_close  = close_all.iloc[ts:te]
     wf_smask  = strict_mask_all.iloc[ts:te]
 
-    strat  = run_strategy(wf_close, wf_probs, THRESHOLD,  COST_BPS)
-    strict = run_strategy(wf_close, wf_probs, STRICT_THR, COST_BPS,
-                          signal_mask=wf_smask)
-    bh_w   = bh_stats(wf_close)
+    strat70 = run_strategy(wf_close, wf_probs, THRESHOLD,  COST_BPS)
+    strat65 = run_strategy(wf_close, wf_probs, STRICT_THR, COST_BPS)
+    strict  = run_strategy(wf_close, wf_probs, STRICT_THR, COST_BPS,
+                           signal_mask=wf_smask)
+    bh_w    = bh_stats(wf_close)
 
     wf_rows.append({
         "window":          wnum,
         "train_end":       dates_all[ts-1].date(),
         "test_start":      dates_all[ts].date(),
         "test_end":        dates_all[te-1].date(),
-        "strat_ret":       strat["total_return"],
+        # thr=0.70 (original strategy)
+        "strat_ret":       strat70["total_return"],
         "bh_ret":          bh_w["total_return"],
-        "excess":          strat["total_return"] - bh_w["total_return"],
-        "max_drawdown":    strat["max_drawdown"],
-        "sharpe":          strat["sharpe"],
-        "invested_pct":    strat["invested_pct"],
+        "excess":          strat70["total_return"] - bh_w["total_return"],
+        "max_drawdown":    strat70["max_drawdown"],
+        "sharpe":          strat70["sharpe"],
+        "invested_pct":    strat70["invested_pct"],
+        # thr=0.65 (prob-only)
+        "thr65_ret":       strat65["total_return"],
+        "thr65_excess":    strat65["total_return"] - bh_w["total_return"],
+        # strict strategy (thr=0.65 + regime filters)
         "strict_ret":      strict["total_return"],
         "strict_excess":   strict["total_return"] - bh_w["total_return"],
         "strict_mdd":      strict["max_drawdown"],
@@ -626,7 +685,7 @@ strict_mask_te = (
     (test_df["rel_vs_mkt_60d"]     >  0)
 ).astype(float)
 
-s_prob65 = run_strategy(test_df["Close"], prob_te, STRICT_THR, COST_BPS)
+# s65 (prob≥0.65 only) was already computed in 6A — reuse it here
 s_strict = run_strategy(test_df["Close"], prob_te, STRICT_THR, COST_BPS,
                         signal_mask=strict_mask_te)
 
@@ -636,9 +695,9 @@ for k, label in [("total_return", "Total return"),
                   ("max_drawdown", "Max drawdown"),
                   ("sharpe",       "Sharpe ratio")]:
     fmt = ".1%" if k != "sharpe" else ".3f"
-    print(f"  {label:<24} {bh[k]:>10{fmt}} {s_prob65[k]:>10{fmt}} {s_strict[k]:>10{fmt}}")
-print(f"  {'Num trades':<24} {'—':>10} {s_prob65['n_trades']:>10} {s_strict['n_trades']:>10}")
-print(f"  {'% days invested':<24} {'100%':>10} {s_prob65['invested_pct']:>10.1%} "
+    print(f"  {label:<24} {bh[k]:>10{fmt}} {s65[k]:>10{fmt}} {s_strict[k]:>10{fmt}}")
+print(f"  {'Num trades':<24} {'—':>10} {s65['n_trades']:>10} {s_strict['n_trades']:>10}")
+print(f"  {'% days invested':<24} {'100%':>10} {s65['invested_pct']:>10.1%} "
       f"{s_strict['invested_pct']:>10.1%}")
 
 # Equity curve: 3 lines — B&H, prob-only 0.65, strict
@@ -647,8 +706,8 @@ fig4, (ax41, ax42) = plt.subplots(2, 1, figsize=(12, 7),
 ax41.plot(test_df.index, bh["equity"],
           label=f"Buy & Hold ({bh['total_return']:+.1%})",
           color="steelblue", lw=2.0)
-ax41.plot(test_df.index, s_prob65["equity"],
-          label=f"Prob ≥ 0.65 only ({s_prob65['total_return']:+.1%})",
+ax41.plot(test_df.index, s65["equity"],
+          label=f"Prob ≥ 0.65 only ({s65['total_return']:+.1%})",
           color="forestgreen", lw=1.6, linestyle="--")
 ax41.plot(test_df.index, s_strict["equity"],
           label=f"Strict: prob≥0.65 + above 200dma + outperform mkt ({s_strict['total_return']:+.1%})",
@@ -662,8 +721,8 @@ ax41.set_title(
 ax41.legend(fontsize=9)
 
 # Position panel: prob-only fill underneath, strict fill on top (strict ⊆ prob-only)
-ax42.fill_between(test_df.index, s_prob65["position"], step="pre",
-                  color="forestgreen", alpha=0.30, label=f"Prob≥0.65 ({s_prob65['invested_pct']:.0%})")
+ax42.fill_between(test_df.index, s65["position"], step="pre",
+                  color="forestgreen", alpha=0.30, label=f"Prob≥0.65 ({s65['invested_pct']:.0%})")
 ax42.fill_between(test_df.index, s_strict["position"], step="pre",
                   color="tomato",      alpha=0.60, label=f"Strict ({s_strict['invested_pct']:.0%})")
 ax42.set_yticks([0, 1]); ax42.set_yticklabels(["Cash", "Long"])
@@ -673,16 +732,16 @@ plt.tight_layout()
 plt.savefig("equity_curve_strict_60d.png", dpi=150, bbox_inches="tight")
 print("  → equity_curve_strict_60d.png")
 
-# Walk-forward strict comparison table
+# Walk-forward strict comparison table (strict vs prob-only-0.65 vs B&H)
 print(f"\n  Walk-forward — Strict vs Prob≥0.65 vs B&H:")
 hdr2 = (f"  {'W':>2}  {'Train end':>11}  {'Test start':>11}  {'Test end':>11}"
-        f"  {'Strict':>8}  {'Prob65':>8}  {'B&H':>8}  {'ExcS':>8}"
+        f"  {'Strict':>8}  {'P≥0.65':>8}  {'B&H':>8}  {'ExcS':>8}"
         f"  {'MDD_S':>7}  {'Sh_S':>6}  {'%Inv_S':>6}  {'#Tr':>5}")
 print(hdr2); print("  " + "-"*(len(hdr2)-2))
 for _, r in wf_df.iterrows():
     print(f"  {int(r['window']):>2}  {str(r['train_end']):>11}  "
           f"{str(r['test_start']):>11}  {str(r['test_end']):>11}"
-          f"  {r['strict_ret']:>+8.1%}  {r['strat_ret']:>+8.1%}"
+          f"  {r['strict_ret']:>+8.1%}  {r['thr65_ret']:>+8.1%}"
           f"  {r['bh_ret']:>+8.1%}  {r['strict_excess']:>+8.1%}"
           f"  {r['strict_mdd']:>7.1%}  {r['strict_sharpe']:>6.3f}"
           f"  {r['strict_inv_pct']:>6.0%}  {int(r['strict_trades']):>5}")
@@ -690,7 +749,7 @@ print("  " + "-"*(len(hdr2)-2))
 for lab, fn in [("Mean  ", wf_df.mean), ("Median", wf_df.median)]:
     a = fn(numeric_only=True)
     print(f"  {lab}                             "
-          f"  {a['strict_ret']:>+8.1%}  {a['strat_ret']:>+8.1%}"
+          f"  {a['strict_ret']:>+8.1%}  {a['thr65_ret']:>+8.1%}"
           f"  {a['bh_ret']:>+8.1%}  {a['strict_excess']:>+8.1%}"
           f"  {a['strict_mdd']:>7.1%}  {a['strict_sharpe']:>6.3f}"
           f"  {a['strict_inv_pct']:>6.0%}  {a['strict_trades']:>5.1f}")
@@ -730,7 +789,10 @@ plt.savefig("walkforward_strict_60d.png", dpi=150, bbox_inches="tight")
 print("  → walkforward_strict_60d.png")
 
 # ── 6E. SAVE FULL FEATURE + PREDICTION CSV ────────────────────────────────────
-out = df_model.copy()
+# CSV uses df_model_fit (1-day lagged features — exactly what the model saw).
+# FEATURE_COLS = all columns used for training.
+# KEY_FEATURES = documented core subset (see Step 4 printout).
+out = df_model_fit.copy()
 out["prob_up_60"]  = np.nan
 out.loc[test_mask, "prob_up_60"] = prob_te
 out["is_test"]     = test_mask.astype(int)
@@ -742,7 +804,8 @@ print("\n" + "=" * 65)
 print("DONE")
 print("=" * 65)
 print(f"  Horizon       : 60 trading days (~3 months)")
-print(f"  Features      : {len(FEATURE_COLS)}")
+print(f"  Features      : {len(FEATURE_COLS)} total  |  {len(KEY_FEATURES)} key features")
+print(f"  Feature lag   : 1 day")
 print(f"  Test AUC      : {test_auc:.4f}")
 print(f"  Data source   : {DATA_SOURCE}")
 print(f"  Outputs       : equity_curve_60d.png          threshold_robustness_60d.png")

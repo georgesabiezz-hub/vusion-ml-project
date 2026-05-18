@@ -43,6 +43,9 @@ SEC_TK   = "EXV3.DE"      # iShares STOXX Europe 600 Technology ETF
 START    = "2014-01-01"
 END      = "2026-01-01"
 LOCAL_CSV = "vu_pa_history_features.csv"
+FUND_CSV  = "vu_pa_fundamentals.csv"
+FUND_COLS = ["pe_ttm", "pb", "fcf_yield", "roe", "roic",
+             "net_margin", "debt_to_equity", "interest_coverage"]
 
 def _try_yfinance():
     """Return (vu_ohlcv, mkt_close, fr_close, sec_close) or raise."""
@@ -286,6 +289,45 @@ df["ret_60d_scaled_vu"]     = df["ret_60d"]         / _vol60
 df["rel_vs_mkt_20d_scaled"] = df["rel_vs_mkt_20d"]  / _vol20
 df["rel_vs_mkt_60d_scaled"] = df["rel_vs_mkt_60d"]  / _vol60
 
+# ── F. FUNDAMENTAL FEATURES ───────────────────────────────────────────────────
+# Annual fundamentals are forward-filled to each trading day so the model
+# always sees the latest reported values.  Rows before the first report
+# (pre-2022) get fund_available=0 and neutral fill values.
+print("  F. Fundamental features (annual, forward-filled) …")
+
+df_fund = pd.read_csv(FUND_CSV)
+df_fund["date"] = pd.to_datetime(df_fund["date"])
+df_fund = df_fund.sort_values("date").reset_index(drop=True)
+
+# merge_asof: for each trading day in df, attach the most recent annual report
+_df_tmp = df.reset_index()                                 # "Date" becomes column
+_df_tmp = pd.merge_asof(
+    _df_tmp.sort_values("Date"),
+    df_fund.rename(columns={"date": "Date"}),
+    on="Date",
+    direction="backward",                                   # ← forward-fill semantics
+)
+_df_tmp = _df_tmp.set_index("Date")
+for col in FUND_COLS:
+    df[col] = _df_tmp[col].values                          # plain array avoids index issues
+
+# Indicator: 1 from the first annual report date onwards, 0 before
+df["fund_available"] = (~df["pb"].isna()).astype(int)
+
+# pe_ttm: NaN means either no data yet (pre-2022) or a loss year (negative EPS).
+# Use -999 so the model treats it as a distinct out-of-range signal.
+df["pe_ttm"] = df["pe_ttm"].fillna(-999)
+
+# Other fundamental columns: pre-report NaN → 0 (neutral; fund_available=0 flags it)
+for col in FUND_COLS:
+    if col != "pe_ttm":
+        df[col] = df[col].fillna(0)
+
+n_fund_rows = int(df["fund_available"].sum())
+print(f"    fund_available=1 on {n_fund_rows}/{len(df)} trading days "
+      f"({n_fund_rows/len(df):.0%})")
+print(f"    pe_ttm=-999 on {(df['pe_ttm']==-999).sum()} days (pre-data + loss years)")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 — TARGET COLUMN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -322,6 +364,8 @@ KEY_FEATURES = [
     # Volatility-scaled
     "ret_5d_scaled_vu", "ret_20d_scaled_vu", "ret_60d_scaled_vu",
     "rel_vs_mkt_20d_scaled", "rel_vs_mkt_60d_scaled",
+    # Fundamentals (annual, forward-filled)
+    *FUND_COLS, "fund_available",
 ]
 assert all(f in FEATURE_COLS for f in KEY_FEATURES), \
     f"KEY_FEATURES contains column(s) not in FEATURE_COLS: " \
@@ -404,6 +448,20 @@ print(f"\n  Top 15 features by importance:")
 for name, val in fi.head(15).items():
     print(f"    {name:<30} {val:>6.0f}")
 
+# Fundamental vs technical importance breakdown
+_fund_fi_cols = FUND_COLS + ["fund_available"]
+fi_fund = fi[_fund_fi_cols].sort_values(ascending=False)
+total_imp = fi.sum()
+print(f"\n  Fundamental features — importance vs technical features:")
+print(f"    {'Feature':<26} {'Importance':>12} {'% of total':>11}")
+print("    " + "-" * 52)
+for name, val in fi_fund.items():
+    print(f"    {name:<26} {val:>12.0f} {val/total_imp:>11.1%}")
+fund_share = fi_fund.sum() / total_imp
+print("    " + "-" * 52)
+print(f"    {'Fund total (9 cols)':<26} {fi_fund.sum():>12.0f} {fund_share:>11.1%}")
+print(f"    {'Technical total':<26} {total_imp - fi_fund.sum():>12.0f} {1-fund_share:>11.1%}")
+
 # Attach predictions to test slice (lagged-feature version)
 test_df = df_model_fit.loc[test_mask].copy()
 test_df["prob_up_60"] = prob_te
@@ -463,26 +521,30 @@ def bh_stats(close_s):
             "sharpe": sharpe(r)}
 
 # ── 6A. EQUITY CURVE — thr=0.65 vs thr=0.70 (cost=0.10%) ────────────────────
-print("\n  6A. Equity curve — thr=0.65 vs thr=0.70 (cost=0.10%) …")
+print("\n  6A. Equity curve — thr=0.60 / 0.65 / 0.70 (cost=0.10%) …")
 
 bh  = bh_stats(test_df["Close"])
+s60 = run_strategy(test_df["Close"], prob_te, 0.60, COST_BPS)
 s65 = run_strategy(test_df["Close"], prob_te, 0.65, COST_BPS)
 s70 = run_strategy(test_df["Close"], prob_te, 0.70, COST_BPS)
 
-print(f"\n  {'Metric':<22} {'Buy&Hold':>10} {'Thr=0.65':>10} {'Thr=0.70':>10}")
-print("  " + "-" * 55)
+print(f"\n  {'Metric':<22} {'Buy&Hold':>10} {'Thr=0.60':>10} {'Thr=0.65':>10} {'Thr=0.70':>10}")
+print("  " + "-" * 65)
 for k, label in [("total_return","Total return"),("max_drawdown","Max drawdown"),
                   ("sharpe","Sharpe ratio")]:
     fmt = ".1%" if k != "sharpe" else ".3f"
-    print(f"  {label:<22} {bh[k]:>10{fmt}} {s65[k]:>10{fmt}} {s70[k]:>10{fmt}}")
-print(f"  {'Num trades':<22} {'—':>10} {s65['n_trades']:>10} {s70['n_trades']:>10}")
-print(f"  {'% days invested':<22} {'100%':>10} {s65['invested_pct']:>10.1%} {s70['invested_pct']:>10.1%}")
+    print(f"  {label:<22} {bh[k]:>10{fmt}} {s60[k]:>10{fmt}} {s65[k]:>10{fmt}} {s70[k]:>10{fmt}}")
+print(f"  {'Num trades':<22} {'—':>10} {s60['n_trades']:>10} {s65['n_trades']:>10} {s70['n_trades']:>10}")
+print(f"  {'% days invested':<22} {'100%':>10} {s60['invested_pct']:>10.1%} {s65['invested_pct']:>10.1%} {s70['invested_pct']:>10.1%}")
 
 fig1, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7),
                                  gridspec_kw={"height_ratios": [3, 1]})
 ax1.plot(test_df.index, bh["equity"],
          label=f"Buy & Hold ({bh['total_return']:+.1%})",
          color="steelblue", lw=2.0)
+ax1.plot(test_df.index, s60["equity"],
+         label=f"LGB thr=0.60 ({s60['total_return']:+.1%})",
+         color="mediumorchid", lw=1.6, linestyle=":")
 ax1.plot(test_df.index, s65["equity"],
          label=f"LGB thr=0.65 ({s65['total_return']:+.1%})",
          color="forestgreen", lw=1.8, linestyle="--")
@@ -492,9 +554,12 @@ ax1.plot(test_df.index, s70["equity"],
 ax1.axhline(1, color="grey", lw=0.7, linestyle=":"); ax1.grid(alpha=0.3)
 ax1.set_ylabel("Equity (start=1.0)")
 ax1.set_title(
-    f"VU.PA — LightGBM 3-Month Strategy: thr=0.65 vs thr=0.70  [{DATA_SOURCE}]",
+    f"VU.PA — LightGBM 3-Month Strategy: thr=0.60 / 0.65 / 0.70  [{DATA_SOURCE}]",
     fontsize=11, fontweight="bold")
 ax1.legend(fontsize=9)
+ax2.fill_between(test_df.index, s60["position"], step="pre",
+                 color="mediumorchid", alpha=0.20,
+                 label=f"Thr=0.60 ({s60['invested_pct']:.0%})")
 ax2.fill_between(test_df.index, s65["position"], step="pre",
                  color="forestgreen", alpha=0.30,
                  label=f"Thr=0.65 ({s65['invested_pct']:.0%})")
@@ -806,6 +871,7 @@ print("=" * 65)
 print(f"  Horizon       : 60 trading days (~3 months)")
 print(f"  Features      : {len(FEATURE_COLS)} total  |  {len(KEY_FEATURES)} key features")
 print(f"  Feature lag   : 1 day")
+print(f"  Fundamentals  : {len(FUND_COLS)+1} cols ({', '.join(FUND_COLS+['fund_available'])})")
 print(f"  Test AUC      : {test_auc:.4f}")
 print(f"  Data source   : {DATA_SOURCE}")
 print(f"  Outputs       : equity_curve_60d.png          threshold_robustness_60d.png")

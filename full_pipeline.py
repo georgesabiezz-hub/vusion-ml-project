@@ -47,6 +47,10 @@ FUND_CSV  = "vu_pa_fundamentals.csv"
 FUND_COLS = ["pe_ttm", "pb", "fcf_yield", "roe", "roic",
              "net_margin", "debt_to_equity", "interest_coverage"]
 
+# Valuation multiples (Step 11)
+FINANCIALS_CSV = "vu_pa_financials.csv"   # sales_ttm & net_debt (EUR M)
+SHARES_OUT     = 14_500_000               # shares outstanding — update as needed
+
 def _try_yfinance():
     """Return (vu_ohlcv, mkt_close, fr_close, sec_close) or raise."""
     import yfinance as yf
@@ -1540,6 +1544,83 @@ else:
 most_robust = max(beats_bh, key=lambda t: (beats_bh[t], t))
 print(f"  ↔ Seuil le plus robuste : thr={most_robust:.2f} "
       f"(bat le B&H sur {beats_bh[most_robust]}/{n_wins} fenêtres)")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 11 — VALUATION MULTIPLES  (market_cap, EV, P/S, EV/Sales)
+# Does NOT modify ML training — columns added after all model steps.
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("STEP 11 — VALUATION MULTIPLES")
+print("=" * 65)
+
+# ── Load financials & forward-fill onto trading calendar ─────────────────────
+_df_fin = pd.read_csv(FINANCIALS_CSV, comment="#")
+_df_fin["date_report"] = pd.to_datetime(_df_fin["date_report"])
+_df_fin = _df_fin.sort_values("date_report").reset_index(drop=True)
+
+_tmp11 = df_model_fit.reset_index()          # Date → column for merge_asof
+_tmp11 = pd.merge_asof(
+    _tmp11.sort_values("Date"),
+    _df_fin.rename(columns={"date_report": "Date"})[["Date", "sales_ttm", "net_debt"]],
+    on="Date", direction="backward"
+).set_index("Date")
+
+df_model_fit["sales_ttm_eur"] = _tmp11["sales_ttm"].values   # EUR M
+df_model_fit["net_debt_eur"]  = _tmp11["net_debt"].values     # EUR M
+
+# ── Compute valuation multiples ───────────────────────────────────────────────
+_mc  = df_model_fit["Close"] * SHARES_OUT                        # market cap, EUR
+_s   = df_model_fit["sales_ttm_eur"] * 1e6                       # sales, EUR
+_nd  = df_model_fit["net_debt_eur"]  * 1e6                       # net debt, EUR
+
+df_model_fit["market_cap"]     = _mc
+df_model_fit["ps_ratio"]       = (_mc / _s).replace([np.inf, -np.inf], np.nan)
+df_model_fit["ev"]             = _mc + _nd
+df_model_fit["ev_sales_ratio"] = ((_mc + _nd) / _s).replace([np.inf, -np.inf], np.nan)
+
+# ── Valuation zone based on historical EV/Sales percentiles ──────────────────
+_evs       = df_model_fit["ev_sales_ratio"].dropna()
+_p20, _p80 = float(_evs.quantile(0.20)), float(_evs.quantile(0.80))
+df_model_fit["valuation_zone"] = pd.cut(
+    df_model_fit["ev_sales_ratio"],
+    bins=[-np.inf, _p20, _p80, np.inf],
+    labels=["low", "mid", "high"]
+)
+
+# ── Descriptive stats ─────────────────────────────────────────────────────────
+_n_val = int(df_model_fit["ps_ratio"].notna().sum())
+_first = df_model_fit["ps_ratio"].first_valid_index()
+_last  = df_model_fit["ps_ratio"].last_valid_index()
+
+print(f"\n  SHARES_OUT      : {SHARES_OUT:,}")
+print(f"  Coverage        : {str(_first)[:10]} → {str(_last)[:10]}  ({_n_val} days)")
+print(f"  Financials file : {FINANCIALS_CSV}  ({len(_df_fin)} annual obs.)")
+
+def _pct_row(label, s):
+    v = s.dropna()
+    print(f"\n  {label}")
+    print(f"    Min / Max   : {v.min():.2f}x  /  {v.max():.2f}x")
+    print(f"    p10 / p25   : {v.quantile(.10):.2f}x  /  {v.quantile(.25):.2f}x")
+    print(f"    Median      : {v.median():.2f}x")
+    print(f"    p75 / p90   : {v.quantile(.75):.2f}x  /  {v.quantile(.90):.2f}x")
+    print(f"    Mean ± std  : {v.mean():.2f}x ± {v.std():.2f}x")
+    last_val = s.dropna().iloc[-1] if not s.dropna().empty else float("nan")
+    print(f"    Latest      : {last_val:.2f}x")
+
+_pct_row("P/S ratio", df_model_fit["ps_ratio"])
+_pct_row("EV/Sales  ratio", df_model_fit["ev_sales_ratio"])
+
+print(f"\n  EV/Sales zone thresholds  (p20={_p20:.2f}x  |  p80={_p80:.2f}x)")
+_zone_counts = df_model_fit["valuation_zone"].value_counts()
+for zone in ["low", "mid", "high"]:
+    cnt  = int(_zone_counts.get(zone, 0))
+    pct  = cnt / _n_val * 100 if _n_val else 0
+    last_zone = str(df_model_fit["valuation_zone"].dropna().iloc[-1]) \
+        if not df_model_fit["valuation_zone"].dropna().empty else "—"
+    print(f"    {zone:4s} : {cnt:>4d} days  ({pct:.0f}%)")
+_last_zone = str(df_model_fit["valuation_zone"].dropna().iloc[-1]) \
+    if not df_model_fit["valuation_zone"].dropna().empty else "—"
+print(f"  Current zone    : {_last_zone}")
 
 print("=" * 65)
 print(f"  Horizon       : 60 trading days (~3 months)")

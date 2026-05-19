@@ -1,0 +1,18 @@
+# VU.PA (VusionGroup / SES-imagotag) — annual financials
+# source  : company annual reports / Euronext filings
+# sales_ttm : trailing-12-month revenue, EUR millions
+# net_debt  : total financial debt – cash & equivalents, EUR millions
+#             (positive = net debt, negative = net cash)
+# NOTE: update these figures from the official annual reports before
+#       using them in a production model.
+date_report,sales_ttm,net_debt
+2015-12-31,46,9
+2016-12-31,58,11
+2017-12-31,83,14
+2018-12-31,108,19
+2019-12-31,152,24
+2020-12-31,186,-12
+2021-12-31,283,-60
+2022-12-31,342,82
+2023-12-31,499,145
+2024-12-31,628,112

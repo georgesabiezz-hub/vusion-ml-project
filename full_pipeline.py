@@ -1171,6 +1171,133 @@ for thr in [0.60, 0.65, 0.70]:
           f"Sharpe@{thr:.2f} : {m[f'sharpe_{k}']:.3f} ± {s_std[f'sharpe_{k}']:.3f}")
 
 print(f"\n  → equity_curve_tuned_60d.png")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 8 — TRADE LOG 2022 → 2026  (thr = 0.60 / 0.65 / 0.70)
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("STEP 8 — TRADE LOG 2022 → 2026")
+print("=" * 65)
+
+TRADE_START = pd.Timestamp("2022-01-01")
+cut_idx = int((df_model_fit.index >= TRADE_START).argmax())
+
+model_log = lgb.LGBMClassifier(**TUNED_PARAMS, is_unbalance=True,
+                                random_state=42, n_jobs=1, verbose=-1)
+model_log.fit(X_all.iloc[:cut_idx], y_all.iloc[:cut_idx])
+prob_log = model_log.predict_proba(X_all.iloc[cut_idx:])[:, 1]
+auc_log  = roc_auc_score(y_all.iloc[cut_idx:], prob_log)
+print(f"\n  Model trained on pre-2022 ({cut_idx} days), OOS AUC = {auc_log:.4f}")
+
+log_df = df_model_fit.iloc[cut_idx:][["Close"]].copy()
+log_df["prob_up_60"] = prob_log
+log_df["mkt_close"]  = df.loc[log_df.index, "mkt_close"]
+
+
+def _build_trades(ldf, thr, n_hold=60):
+    d   = ldf.index.tolist()
+    cl  = ldf["Close"].values
+    mk  = ldf["mkt_close"].values
+    pr  = ldf["prob_up_60"].values
+    n   = len(d)
+    out = []
+    i   = 0
+    while i < n:
+        if pr[i] >= thr:
+            e_i = i
+            x_i = min(i + n_hold, n - 1)
+            ret_vu  = cl[x_i] / cl[e_i] - 1
+            ret_mkt = mk[x_i] / mk[e_i] - 1
+            seg     = cl[e_i:x_i + 1]
+            cum_max = np.maximum.accumulate(seg)
+            mdd     = float(((seg - cum_max) / cum_max).min())
+            out.append({
+                "date_entree":  d[e_i],
+                "date_sortie":  d[x_i],
+                "jours":        x_i - e_i,
+                "prob_entree":  round(float(pr[e_i]), 4),
+                "ret_vu":       round(ret_vu, 4),
+                "ret_mkt":      round(ret_mkt, 4),
+                "alpha":        round(ret_vu - ret_mkt, 4),
+                "max_drawdown": round(mdd, 4),
+            })
+            i = x_i + 1
+        else:
+            i += 1
+    return pd.DataFrame(out)
+
+
+all_logs = {}
+for _thr in [0.60, 0.65, 0.70]:
+    tdf = _build_trades(log_df, _thr)
+    tdf["threshold"] = _thr
+    all_logs[_thr] = tdf
+
+# ── Per-threshold summaries ───────────────────────────────────────────────────
+print()
+for _thr in [0.60, 0.65, 0.70]:
+    tdf = all_logs[_thr]
+    if tdf.empty:
+        print(f"  thr={_thr:.2f}: no trades triggered")
+        continue
+    nb          = len(tdf)
+    pct_pos     = (tdf["ret_vu"] > 0).mean()
+    mean_ret    = tdf["ret_vu"].mean()
+    med_ret     = tdf["ret_vu"].median()
+    pct_beats   = (tdf["alpha"] > 0).mean()
+    best_ret    = tdf["ret_vu"].max()
+    worst_ret   = tdf["ret_vu"].min()
+    mean_dd     = tdf["max_drawdown"].mean()
+    print(f"  ── thr = {_thr:.2f} ──────────────────────────────────────────")
+    print(f"     Trades        : {nb}")
+    print(f"     % profitable  : {pct_pos:.0%}")
+    print(f"     Mean ret      : {mean_ret:+.2%}   Median: {med_ret:+.2%}")
+    print(f"     % beats mkt   : {pct_beats:.0%}")
+    print(f"     Best / Worst  : {best_ret:+.2%} / {worst_ret:+.2%}")
+    print(f"     Avg max DD    : {mean_dd:.2%}")
+    print()
+
+# ── Comparative table ─────────────────────────────────────────────────────────
+print(f"  {'Thr':>5}  {'#Trades':>8} {'%Prof':>6} {'MeanRet':>8} "
+      f"{'MedRet':>8} {'%BeatsMkt':>10} {'AvgDD':>7}")
+print("  " + "-" * 57)
+for _thr in [0.60, 0.65, 0.70]:
+    tdf = all_logs[_thr]
+    if tdf.empty:
+        print(f"  {_thr:.2f}     {'—':>8}")
+        continue
+    print(f"  {_thr:.2f}   {len(tdf):>8d} "
+          f"{(tdf['ret_vu']>0).mean():>6.0%} "
+          f"{tdf['ret_vu'].mean():>+8.2%} "
+          f"{tdf['ret_vu'].median():>+8.2%} "
+          f"{(tdf['alpha']>0).mean():>10.0%} "
+          f"{tdf['max_drawdown'].mean():>7.2%}")
+
+# ── Top 3 / Bottom 3 per threshold ───────────────────────────────────────────
+print()
+for _thr in [0.60, 0.65, 0.70]:
+    tdf = all_logs[_thr]
+    if tdf.empty:
+        continue
+    top3 = tdf.nlargest(3, "ret_vu")[
+        ["date_entree", "date_sortie", "prob_entree", "ret_vu", "alpha"]]
+    bot3 = tdf.nsmallest(3, "ret_vu")[
+        ["date_entree", "date_sortie", "prob_entree", "ret_vu", "alpha"]]
+    print(f"  thr={_thr:.2f}  TOP 3:")
+    for _, r in top3.iterrows():
+        print(f"    {str(r.date_entree)[:10]} → {str(r.date_sortie)[:10]}  "
+              f"prob={r.prob_entree:.3f}  ret={r.ret_vu:+.2%}  alpha={r.alpha:+.2%}")
+    print(f"  thr={_thr:.2f}  BOTTOM 3:")
+    for _, r in bot3.iterrows():
+        print(f"    {str(r.date_entree)[:10]} → {str(r.date_sortie)[:10]}  "
+              f"prob={r.prob_entree:.3f}  ret={r.ret_vu:+.2%}  alpha={r.alpha:+.2%}")
+    print()
+
+# ── Save CSV ──────────────────────────────────────────────────────────────────
+all_trades_df = pd.concat(all_logs.values(), ignore_index=True)
+all_trades_df.to_csv("trade_log_60d.csv", index=False)
+print(f"  → trade_log_60d.csv  ({len(all_trades_df)} rows)")
+
 print("=" * 65)
 print(f"  Horizon       : 60 trading days (~3 months)")
 print(f"  Features      : {len(FEATURE_COLS)} total  |  {len(KEY_FEATURES)} key features")
@@ -1181,4 +1308,4 @@ print(f"  Data source   : {DATA_SOURCE}")
 print(f"  Outputs       : equity_curve_60d.png          threshold_robustness_60d.png")
 print(f"                  equity_curve_strict_60d.png  equity_curve_tuned_60d.png")
 print(f"                  walkforward_60d.png           walkforward_strict_60d.png")
-print(f"                  vu_pa_full_pipeline_60d.csv")
+print(f"                  vu_pa_full_pipeline_60d.csv  trade_log_60d.csv")

@@ -1396,6 +1396,151 @@ print(f"  ↔ Meilleur ratio rendement/risque: {best_row['label']} "
       f"(CAGR {best_cagr_val:+.1%}, DD {best_row['max_drawdown']:.1%}) "
       f"vs drawdown le plus faible: {best_dd_label} ({best_dd_val:.1%})")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 10 — ROLLING WINDOW ANALYSIS (OOS per window)
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("STEP 10 — ROLLING WINDOW ANALYSIS  (OOS model per window)")
+print("=" * 65)
+
+WINDOWS = [
+    ("win1 2018-2020", "2018-01-01", "2020-01-01"),
+    ("win2 2020-2022", "2020-01-01", "2022-01-01"),
+    ("win3 2022-2024", "2022-01-01", "2024-01-01"),
+    ("win4 2024-2026", "2024-01-01", None),
+]
+MIN_TRAIN_W = 400
+
+def _win_metrics(daily_rets, equity):
+    n  = len(daily_rets)
+    tr = float(equity.iloc[-1] - 1)
+    return {
+        "total_return": tr,
+        "cagr":         _cagr(tr, n),
+        "max_drawdown": max_dd(equity),
+        "ann_vol":      _ann_vol(daily_rets),
+        "sharpe":       sharpe(daily_rets),
+    }
+
+win10_rows = []
+
+for win_label, win_start, win_end in WINDOWS:
+    ws = pd.Timestamp(win_start)
+    we = df_model_fit.index[-1] if win_end is None else pd.Timestamp(win_end)
+
+    w_mask  = (df_model_fit.index >= ws) & (df_model_fit.index < we)
+    close_w = df_model_fit.loc[w_mask, "Close"]
+    if len(close_w) < 20:
+        continue
+
+    # ── Buy & Hold ────────────────────────────────────────────────────────────
+    bh_r = close_w.pct_change().fillna(0.0)
+    bh_e = (1 + bh_r).cumprod()
+    win10_rows.append({"window": win_label, "strategy": "Buy & Hold",
+                       **_win_metrics(bh_r, bh_e)})
+
+    # ── Train OOS model on everything before window start ─────────────────────
+    pre_mask = df_model_fit.index < ws
+    n_pre    = int(pre_mask.sum())
+    if n_pre < MIN_TRAIN_W:
+        for _thr in [0.60, 0.65, 0.70]:
+            win10_rows.append({"window": win_label, "strategy": f"ML thr={_thr:.2f}",
+                               "total_return": np.nan, "cagr": np.nan,
+                               "max_drawdown": np.nan, "ann_vol": np.nan,
+                               "sharpe": np.nan})
+        continue
+
+    m_w = lgb.LGBMClassifier(**TUNED_PARAMS, is_unbalance=True,
+                              random_state=42, n_jobs=1, verbose=-1)
+    m_w.fit(X_all[pre_mask], y_all[pre_mask])
+    prob_w = pd.Series(
+        m_w.predict_proba(X_all[w_mask])[:, 1],
+        index=close_w.index)
+
+    # ── ML strategies ─────────────────────────────────────────────────────────
+    for _thr in [0.60, 0.65, 0.70]:
+        s = run_strategy(close_w, prob_w, _thr, COST_BPS)
+        win10_rows.append({"window": win_label, "strategy": f"ML thr={_thr:.2f}",
+                           **_win_metrics(s["ret_strat"], s["equity"])})
+
+win10_df = pd.DataFrame(win10_rows)
+
+# ── Display table ─────────────────────────────────────────────────────────────
+def _w10_fmt(v, pct=True, signed=True):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "     —"
+    if pct:
+        return f"{v:>+7.1%}" if signed else f"{v:>7.1%}"
+    return f"{v:>7.3f}"
+
+print()
+for win_label, _, _ in WINDOWS:
+    sub = win10_df[win10_df["window"] == win_label]
+    if sub.empty:
+        continue
+    we_label = [w[2] for w in WINDOWS if w[0] == win_label][0] or "latest"
+    ws_label = [w[1] for w in WINDOWS if w[0] == win_label][0]
+    n_days   = int(w_mask.sum()) if win_label == WINDOWS[-1][0] else None
+    # re-compute n_days per window cleanly
+    _ws = pd.Timestamp([w[1] for w in WINDOWS if w[0] == win_label][0])
+    _we_str = [w[2] for w in WINDOWS if w[0] == win_label][0]
+    _we = df_model_fit.index[-1] if _we_str is None else pd.Timestamp(_we_str)
+    _n  = int(((df_model_fit.index >= _ws) & (df_model_fit.index < _we)).sum())
+    print(f"  ── {win_label}  ({_n} days) ───────────────────────────────────")
+    print(f"  {'Strategy':<16} {'TotalRet':>8} {'CAGR':>8} "
+          f"{'MaxDD':>8} {'AnnVol':>8} {'Sharpe':>8}")
+    print("  " + "-" * 52)
+    for _, r in sub.iterrows():
+        print(f"  {r['strategy']:<16}"
+              f" {_w10_fmt(r['total_return'])}"
+              f" {_w10_fmt(r['cagr'])}"
+              f" {_w10_fmt(r['max_drawdown'], signed=False)}"
+              f" {_w10_fmt(r['ann_vol'], signed=False)}"
+              f" {_w10_fmt(r['sharpe'], pct=False)}")
+    print()
+
+# ── Commentary ────────────────────────────────────────────────────────────────
+thresholds = [0.60, 0.65, 0.70]
+win_labels = [w[0] for w in WINDOWS]
+n_wins     = len(win_labels)
+
+beats_bh   = {thr: 0 for thr in thresholds}
+beats_10   = {thr: 0 for thr in thresholds}
+
+for win_label in win_labels:
+    sub = win10_df[win10_df["window"] == win_label]
+    bh_cagr_w = sub.loc[sub["strategy"] == "Buy & Hold", "cagr"]
+    if bh_cagr_w.empty or np.isnan(bh_cagr_w.iloc[0]):
+        continue
+    bh_c = float(bh_cagr_w.iloc[0])
+    for _thr in thresholds:
+        ml_row = sub[sub["strategy"] == f"ML thr={_thr:.2f}"]
+        if ml_row.empty:
+            continue
+        ml_c = float(ml_row["cagr"].iloc[0])
+        if not np.isnan(ml_c):
+            if ml_c > bh_c:
+                beats_bh[_thr] += 1
+            if ml_c > 0.10:
+                beats_10[_thr] += 1
+
+print(f"  Fenêtres où chaque seuil ML bat le B&H en CAGR "
+      f"(sur {n_wins} fenêtres):")
+for _thr in thresholds:
+    bar = "█" * beats_bh[_thr] + "░" * (n_wins - beats_bh[_thr])
+    print(f"    thr={_thr:.2f} : {beats_bh[_thr]}/{n_wins}  {bar}")
+
+any_10 = {_thr: beats_10[_thr] for _thr in thresholds if beats_10[_thr] > 0}
+if any_10:
+    for _thr, cnt in any_10.items():
+        print(f"  ✔ thr={_thr:.2f} dépasse 10%/an sur {cnt} fenêtre(s)")
+else:
+    print(f"  ✗ Aucun seuil n'atteint 10%/an sur aucune fenêtre")
+
+most_robust = max(beats_bh, key=lambda t: (beats_bh[t], t))
+print(f"  ↔ Seuil le plus robuste : thr={most_robust:.2f} "
+      f"(bat le B&H sur {beats_bh[most_robust]}/{n_wins} fenêtres)")
+
 print("=" * 65)
 print(f"  Horizon       : 60 trading days (~3 months)")
 print(f"  Features      : {len(FEATURE_COLS)} total  |  {len(KEY_FEATURES)} key features")

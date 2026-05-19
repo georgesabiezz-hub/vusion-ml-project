@@ -1622,6 +1622,103 @@ _last_zone = str(df_model_fit["valuation_zone"].dropna().iloc[-1]) \
     if not df_model_fit["valuation_zone"].dropna().empty else "—"
 print(f"  Current zone    : {_last_zone}")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 12 — FORWARD VALUATION  (EV/Sales multiples approach)
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("STEP 12 — FORWARD VALUATION")
+print("=" * 65)
+
+# ── Scenario constants ────────────────────────────────────────────────────────
+VAL_HORIZON_YEARS = 3
+
+#                              g/yr    EV/Sales target    label
+SCENARIOS = [
+    ("Prudent",    dict(g=0.12, ev_mult=3.5)),
+    ("Base",       dict(g=0.20, ev_mult=4.5)),
+    ("Optimiste",  dict(g=0.28, ev_mult=5.5)),
+]
+# Add a "normalisation" scenario when stock is in the low zone
+_ADD_NORM = (_last_zone == "low")
+if _ADD_NORM:
+    SCENARIOS.append(("Normalisation", dict(g=0.20, ev_mult=5.0)))
+
+# ── Snapshot: last available trading day ─────────────────────────────────────
+_snap = df_model_fit[df_model_fit["ev_sales_ratio"].notna()].iloc[-1]
+_snap_date      = _snap.name
+_close_now      = float(_snap["Close"])
+_sales_now      = float(_snap["sales_ttm_eur"])   # EUR M
+_net_debt_now   = float(_snap["net_debt_eur"])     # EUR M
+_evs_now        = float(_snap["ev_sales_ratio"])
+_ps_now         = float(_snap["ps_ratio"])
+_mc_now         = float(_snap["market_cap"])
+
+print(f"\n  Snapshot date   : {str(_snap_date)[:10]}")
+print(f"  Close           : {_close_now:.2f} €")
+print(f"  Market cap      : {_mc_now/1e6:.0f} M€  "
+      f"(SHARES_OUT = {SHARES_OUT:,})")
+print(f"  Sales TTM       : {_sales_now:.0f} M€")
+print(f"  Net debt        : {_net_debt_now:+.0f} M€")
+print(f"  EV/Sales now    : {_evs_now:.2f}x   P/S now: {_ps_now:.2f}x")
+_med_evs = float(df_model_fit["ev_sales_ratio"].median())
+print(f"  Valuation zone  : {_last_zone}  "
+      f"(p20={_p20:.2f}x  median={_med_evs:.2f}x  p80={_p80:.2f}x)")
+
+# ── Per-scenario calculation ──────────────────────────────────────────────────
+def _scenario(sales_now, net_debt_now, close_now,
+              g, ev_mult, horizon, shares):
+    sales_f  = sales_now  * (1 + g) ** horizon          # EUR M
+    ev_f     = ev_mult    * sales_f                      # EUR M
+    equity_f = ev_f - net_debt_now                       # EUR M  (net_debt constant)
+    price_f  = equity_f * 1e6 / shares                   # EUR
+    cagr     = (price_f / close_now) ** (1 / horizon) - 1
+    return {"sales_f": sales_f, "ev_f": ev_f,
+            "equity_f": equity_f, "price_f": price_f, "cagr": cagr}
+
+print(f"\n  Horizon : {VAL_HORIZON_YEARS} ans\n")
+print(f"  {'Scénario':<14} {'g/an':>6} {'Mult':>6}  "
+      f"{'Sales futur':>12} {'EV futur':>10} "
+      f"{'Prix cible':>11} {'CAGR impl.':>11}")
+print("  " + "-" * 67)
+
+results = {}
+for name, params in SCENARIOS:
+    r = _scenario(_sales_now, _net_debt_now, _close_now,
+                  params["g"], params["ev_mult"],
+                  VAL_HORIZON_YEARS, SHARES_OUT)
+    results[name] = r
+    updown = (r["price_f"] / _close_now - 1)
+    print(f"  {name:<14} {params['g']:>+6.0%} {params['ev_mult']:>5.1f}x"
+          f"  {r['sales_f']:>9.0f} M€"
+          f"  {r['ev_f']:>7.0f} M€"
+          f"  {r['price_f']:>8.2f} €  ({updown:>+6.0%})"
+          f"  {r['cagr']:>+8.1%}/an")
+
+# ── Range summary ─────────────────────────────────────────────────────────────
+_base  = results["Base"]
+_prud  = results["Prudent"]
+_opti  = results["Optimiste"]
+
+print(f"\n  {'':14}  Close actuel : {_close_now:.2f} €")
+print(f"  {'':14}  Fourchette   : "
+      f"{_prud['price_f']:.2f} € – {_opti['price_f']:.2f} €  "
+      f"({VAL_HORIZON_YEARS} ans)")
+print(f"  {'':14}  CAGR range   : "
+      f"{_prud['cagr']:+.1%} / {_base['cagr']:+.1%} / {_opti['cagr']:+.1%}  "
+      f"(prudent / base / optimiste)")
+if _ADD_NORM:
+    _norm = results["Normalisation"]
+    print(f"  {'':14}  Normalisation (5.0x) : "
+          f"{_norm['price_f']:.2f} €  →  CAGR {_norm['cagr']:+.1%}/an")
+
+print(f"\n  Hypothèses communes :")
+print(f"    • Dette nette constante à {_net_debt_now:+.0f} M€ sur {VAL_HORIZON_YEARS} ans")
+print(f"    • SHARES_OUT fixe à {SHARES_OUT:,}")
+print(f"    • Pas de dilution / rachat d'actions")
+print(f"    • Taux sans risque non modélisé (pas de DCF)")
+
+
+
 print("=" * 65)
 print(f"  Horizon       : 60 trading days (~3 months)")
 print(f"  Features      : {len(FEATURE_COLS)} total  |  {len(KEY_FEATURES)} key features")

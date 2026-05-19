@@ -865,15 +865,320 @@ out["data_source"] = DATA_SOURCE
 out.to_csv("vu_pa_full_pipeline_60d.csv")
 print(f"\n  → vu_pa_full_pipeline_60d.csv  ({len(out)} rows, {len(out.columns)} cols)")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7 — ROBUSTNESS: STABILITY + HYPERPARAMETER TUNING
+# ─────────────────────────────────────────────────────────────────────────────
 print("\n" + "=" * 65)
-print("DONE")
+print("STEP 7 — ROBUSTNESS: STABILITY + HYPERPARAMETER TUNING")
+print("=" * 65)
+
+BASE_PARAMS = dict(
+    n_estimators=300, learning_rate=0.05,
+    max_depth=4, num_leaves=20, min_data_in_leaf=50,
+    feature_fraction=0.7, subsample=0.8,
+    reg_alpha=0.1, reg_lambda=1.0,
+)
+
+# ── 7A. Stability across 5 random seeds ──────────────────────────────────────
+print("\n  7A. Stability check — 5 random seeds (baseline params) …")
+
+SEEDS = [0, 1, 2, 3, 4]
+stab_rows = []
+for seed in SEEDS:
+    m_s = lgb.LGBMClassifier(**BASE_PARAMS, is_unbalance=True,
+                              random_state=seed, n_jobs=1, verbose=-1)
+    m_s.fit(X_tr, y_tr)
+    p_s   = m_s.predict_proba(X_te)[:, 1]
+    auc_s = roc_auc_score(y_te, p_s)
+    row   = {"seed": seed, "auc": auc_s}
+    for thr in [0.60, 0.65, 0.70]:
+        st = run_strategy(test_df["Close"], p_s, thr, COST_BPS)
+        k  = f"{thr:.2f}"
+        row[f"ret_{k}"]    = st["total_return"]
+        row[f"sharpe_{k}"] = st["sharpe"]
+    stab_rows.append(row)
+
+stab_df = pd.DataFrame(stab_rows)
+
+print(f"\n  {'Seed':>5}  {'AUC':>7}  "
+      f"{'Ret@0.60':>9} {'Sh@0.60':>8}  "
+      f"{'Ret@0.65':>9} {'Sh@0.65':>8}  "
+      f"{'Ret@0.70':>9} {'Sh@0.70':>8}")
+print("  " + "-" * 76)
+for _, r in stab_df.iterrows():
+    print(f"  {int(r['seed']):>5}  {r['auc']:>7.4f}  "
+          f"{r['ret_0.60']:>9.1%} {r['sharpe_0.60']:>8.3f}  "
+          f"{r['ret_0.65']:>9.1%} {r['sharpe_0.65']:>8.3f}  "
+          f"{r['ret_0.70']:>9.1%} {r['sharpe_0.70']:>8.3f}")
+print("  " + "-" * 76)
+for lab, fn in [("Mean", stab_df.mean), ("Std ", stab_df.std)]:
+    a = fn(numeric_only=True)
+    print(f"  {lab:>5}  {a['auc']:>7.4f}  "
+          f"{a['ret_0.60']:>9.1%} {a['sharpe_0.60']:>8.3f}  "
+          f"{a['ret_0.65']:>9.1%} {a['sharpe_0.65']:>8.3f}  "
+          f"{a['ret_0.70']:>9.1%} {a['sharpe_0.70']:>8.3f}")
+
+# ── 7B. Hyperparameter random search (15 combos, chrono val split) ────────────
+print("\n  7B. Hyperparameter search (15 random combos, chrono val split) …")
+
+VAL_FRAC  = 0.25
+val_cut   = int(len(X_tr) * (1 - VAL_FRAC))
+X_tr_s    = X_tr.iloc[:val_cut];  y_tr_s  = y_tr.iloc[:val_cut]
+X_val     = X_tr.iloc[val_cut:];  y_val   = y_tr.iloc[val_cut:]
+close_val = df_model_fit.loc[train_mask, "Close"].iloc[val_cut:]
+
+print(f"    Sub-train : {X_tr_s.index[0].date()} → {X_tr_s.index[-1].date()} "
+      f"({len(X_tr_s)} rows)")
+print(f"    Validation: {X_val.index[0].date()} → {X_val.index[-1].date()} "
+      f"({len(X_val)} rows)")
+
+SEARCH_SPACE = {
+    "num_leaves":       [15, 20, 31, 40, 50, 63],
+    "max_depth":        [3, 4, 5, 6, -1],
+    "min_data_in_leaf": [30, 50, 70, 100, 150],
+    "feature_fraction": [0.5, 0.6, 0.7, 0.8, 0.9],
+    "subsample":        [0.6, 0.7, 0.8, 0.9, 1.0],
+    "reg_alpha":        [0.0, 0.05, 0.1, 0.3, 0.5],
+    "reg_lambda":       [0.5, 1.0, 2.0, 5.0, 10.0],
+}
+N_SEARCH = 15
+rng_hp   = np.random.default_rng(99)
+
+hp_rows = []
+for _ in range(N_SEARCH):
+    params = {k: rng_hp.choice(v).item() for k, v in SEARCH_SPACE.items()}
+    m_hp = lgb.LGBMClassifier(
+        n_estimators=200, learning_rate=0.05,
+        num_leaves=int(params["num_leaves"]),
+        max_depth=int(params["max_depth"]),
+        min_data_in_leaf=int(params["min_data_in_leaf"]),
+        feature_fraction=float(params["feature_fraction"]),
+        subsample=float(params["subsample"]),
+        reg_alpha=float(params["reg_alpha"]),
+        reg_lambda=float(params["reg_lambda"]),
+        is_unbalance=True, random_state=42, n_jobs=1, verbose=-1,
+    )
+    m_hp.fit(X_tr_s, y_tr_s)
+    p_val_hp  = m_hp.predict_proba(X_val)[:, 1]
+    val_auc   = roc_auc_score(y_val, p_val_hp)
+    strat_val = run_strategy(close_val, p_val_hp, 0.65, COST_BPS)
+    hp_rows.append({**params, "val_auc": val_auc, "val_sharpe": strat_val["sharpe"]})
+
+hp_df = pd.DataFrame(hp_rows)
+
+def _norm01(s):
+    lo, hi = s.min(), s.max()
+    return (s - lo) / (hi - lo) if hi > lo else pd.Series(0.5, index=s.index)
+
+hp_df["score"] = 0.5 * _norm01(hp_df["val_auc"]) + 0.5 * _norm01(hp_df["val_sharpe"])
+hp_df = hp_df.sort_values("score", ascending=False).reset_index(drop=True)
+
+print(f"\n  Top 5 combos  (score = 0.5 × norm_AUC + 0.5 × norm_Sharpe@0.65):")
+print(f"  {'#':>3}  {'leaves':>6} {'depth':>6} {'minleaf':>8} "
+      f"{'feat_f':>7} {'sub_f':>7} {'L1':>6} {'L2':>7}  "
+      f"{'Val AUC':>8} {'Val Sh':>8} {'Score':>7}")
+print("  " + "-" * 85)
+for combo_i, (_, r) in enumerate(hp_df.head(5).iterrows(), 1):
+    print(f"  {combo_i:>3}  {int(r['num_leaves']):>6} {int(r['max_depth']):>6} "
+          f"{int(r['min_data_in_leaf']):>8} {r['feature_fraction']:>7.2f} "
+          f"{r['subsample']:>7.2f} {r['reg_alpha']:>6.2f} {r['reg_lambda']:>7.1f}  "
+          f"{r['val_auc']:>8.4f} {r['val_sharpe']:>8.3f} {r['score']:>7.3f}")
+
+best = hp_df.iloc[0]
+TUNED_PARAMS = dict(
+    n_estimators=300, learning_rate=0.05,
+    num_leaves        = int(best["num_leaves"]),
+    max_depth         = int(best["max_depth"]),
+    min_data_in_leaf  = int(best["min_data_in_leaf"]),
+    feature_fraction  = float(best["feature_fraction"]),
+    subsample         = float(best["subsample"]),
+    reg_alpha         = float(best["reg_alpha"]),
+    reg_lambda        = float(best["reg_lambda"]),
+)
+print(f"\n  Best params selected:")
+print(f"    num_leaves={TUNED_PARAMS['num_leaves']}, max_depth={TUNED_PARAMS['max_depth']}, "
+      f"min_data_in_leaf={TUNED_PARAMS['min_data_in_leaf']}")
+print(f"    feature_fraction={TUNED_PARAMS['feature_fraction']:.2f}, "
+      f"subsample={TUNED_PARAMS['subsample']:.2f}, "
+      f"reg_alpha={TUNED_PARAMS['reg_alpha']:.2f}, "
+      f"reg_lambda={TUNED_PARAMS['reg_lambda']:.1f}")
+
+# ── 7C. Retrain with tuned params + full train set ────────────────────────────
+print("\n  7C. Retrain with tuned params (full train set) …")
+
+model_tuned   = lgb.LGBMClassifier(**TUNED_PARAMS, is_unbalance=True,
+                                    random_state=42, n_jobs=1, verbose=-1)
+model_tuned.fit(X_tr, y_tr)
+prob_te_tuned = model_tuned.predict_proba(X_te)[:, 1]
+auc_tr_tuned  = roc_auc_score(y_tr, model_tuned.predict_proba(X_tr)[:, 1])
+auc_te_tuned  = roc_auc_score(y_te, prob_te_tuned)
+
+print(f"  Train AUC: {auc_tr_tuned:.4f}  |  Test AUC: {auc_te_tuned:.4f}  "
+      f"(baseline: {test_auc:.4f})")
+
+tuned_strats = {}
+for thr in [0.60, 0.65, 0.70]:
+    tuned_strats[thr] = run_strategy(test_df["Close"], prob_te_tuned, thr, COST_BPS)
+
+print(f"\n  {'Metric':<22} {'Buy&Hold':>10} {'Thr=0.60':>10} {'Thr=0.65':>10} {'Thr=0.70':>10}")
+print("  " + "-" * 65)
+for k, label in [("total_return","Total return"),("max_drawdown","Max drawdown"),
+                  ("sharpe","Sharpe ratio")]:
+    fmt = ".1%" if k != "sharpe" else ".3f"
+    print(f"  {label:<22} {bh[k]:>10{fmt}} "
+          f"{tuned_strats[0.60][k]:>10{fmt}} "
+          f"{tuned_strats[0.65][k]:>10{fmt}} "
+          f"{tuned_strats[0.70][k]:>10{fmt}}")
+print(f"  {'Num trades':<22} {'—':>10} "
+      f"{tuned_strats[0.60]['n_trades']:>10} "
+      f"{tuned_strats[0.65]['n_trades']:>10} "
+      f"{tuned_strats[0.70]['n_trades']:>10}")
+print(f"  {'% days invested':<22} {'100%':>10} "
+      f"{tuned_strats[0.60]['invested_pct']:>10.1%} "
+      f"{tuned_strats[0.65]['invested_pct']:>10.1%} "
+      f"{tuned_strats[0.70]['invested_pct']:>10.1%}")
+
+# Equity curve — baseline vs tuned (thr=0.65)
+fig_tuned, ax_tuned = plt.subplots(figsize=(12, 5))
+ax_tuned.plot(test_df.index, bh["equity"],
+              label=f"Buy & Hold ({bh['total_return']:+.1%})",
+              color="steelblue", lw=2.0)
+ax_tuned.plot(test_df.index, s65["equity"],
+              label=f"Baseline thr=0.65 ({s65['total_return']:+.1%})",
+              color="forestgreen", lw=1.8, linestyle="--")
+ax_tuned.plot(test_df.index, tuned_strats[0.65]["equity"],
+              label=f"Tuned thr=0.65 ({tuned_strats[0.65]['total_return']:+.1%})",
+              color="tomato", lw=1.8)
+ax_tuned.axhline(1, color="grey", lw=0.7, linestyle=":")
+ax_tuned.grid(alpha=0.3); ax_tuned.set_ylabel("Equity (start=1.0)")
+ax_tuned.set_title(
+    f"VU.PA — Baseline vs Tuned LightGBM (thr=0.65, 60-day)  [{DATA_SOURCE}]",
+    fontsize=11, fontweight="bold")
+ax_tuned.legend(fontsize=9)
+plt.tight_layout()
+plt.savefig("equity_curve_tuned_60d.png", dpi=150, bbox_inches="tight")
+print("  → equity_curve_tuned_60d.png")
+
+# ── 7D. Walk-forward with tuned params ────────────────────────────────────────
+print("\n  7D. Walk-forward — tuned model (thr=0.65) …")
+
+WF_THR_TUNED = 0.65
+wf_t_rows = []
+train_end = MIN_TRAIN
+wnum = 0
+while train_end + TEST_BLOCK <= len(df_model_fit):
+    ts, te = train_end, min(train_end + TEST_BLOCK, len(df_model_fit))
+    wnum  += 1
+    wf_m_t = lgb.LGBMClassifier(**TUNED_PARAMS, is_unbalance=True,
+                                  random_state=42, n_jobs=1, verbose=-1)
+    wf_m_t.fit(X_all.iloc[:ts], y_all.iloc[:ts])
+    wf_probs_t = wf_m_t.predict_proba(X_all.iloc[ts:te])[:, 1]
+    wf_close   = close_all.iloc[ts:te]
+    strat_t    = run_strategy(wf_close, wf_probs_t, WF_THR_TUNED, COST_BPS)
+    bh_w_t     = bh_stats(wf_close)
+    wf_t_rows.append({
+        "window":       wnum,
+        "train_end":    dates_all[ts-1].date(),
+        "test_start":   dates_all[ts].date(),
+        "test_end":     dates_all[te-1].date(),
+        "strat_ret":    strat_t["total_return"],
+        "bh_ret":       bh_w_t["total_return"],
+        "excess":       strat_t["total_return"] - bh_w_t["total_return"],
+        "max_drawdown": strat_t["max_drawdown"],
+        "sharpe":       strat_t["sharpe"],
+        "invested_pct": strat_t["invested_pct"],
+    })
+    train_end += TEST_BLOCK
+
+wf_t_df = pd.DataFrame(wf_t_rows)
+hdr_t = (f"  {'W':>2}  {'Train end':>11}  {'Test start':>11}  {'Test end':>11}"
+         f"  {'Ret':>7}  {'B&H':>7}  {'Excess':>7}  {'MDD':>7}  {'Sharpe':>6}  {'%Inv':>5}")
+print(hdr_t); print("  " + "-"*(len(hdr_t)-2))
+for _, r in wf_t_df.iterrows():
+    print(f"  {int(r['window']):>2}  {str(r['train_end']):>11}  "
+          f"{str(r['test_start']):>11}  {str(r['test_end']):>11}"
+          f"  {r['strat_ret']:>+7.1%}  {r['bh_ret']:>+7.1%}"
+          f"  {r['excess']:>+7.1%}  {r['max_drawdown']:>7.1%}"
+          f"  {r['sharpe']:>6.3f}  {r['invested_pct']:>4.0%}")
+print("  " + "-"*(len(hdr_t)-2))
+for lab, fn in [("Mean  ", wf_t_df.mean), ("Median", wf_t_df.median)]:
+    a = fn(numeric_only=True)
+    print(f"  {lab}                             "
+          f"  {a['strat_ret']:>+7.1%}  {a['bh_ret']:>+7.1%}"
+          f"  {a['excess']:>+7.1%}  {a['max_drawdown']:>7.1%}"
+          f"  {a['sharpe']:>6.3f}  {a['invested_pct']:>4.0%}")
+t_wins = (wf_t_df["excess"] > 0).sum()
+print(f"  Tuned strategy beat B&H in {t_wins}/{len(wf_t_df)} windows")
+
+# ── 7E. Summary: before vs after ─────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("STEP 7 — SUMMARY: BASELINE vs TUNED")
+print("=" * 65)
+
+print(f"\n  A. Hyperparameters")
+print(f"     {'Parameter':<20} {'Baseline':>12} {'Tuned':>12}")
+print(f"     " + "-" * 46)
+param_map = [
+    ("num_leaves",       BASE_PARAMS["num_leaves"],       TUNED_PARAMS["num_leaves"]),
+    ("max_depth",        BASE_PARAMS["max_depth"],        TUNED_PARAMS["max_depth"]),
+    ("min_data_in_leaf", BASE_PARAMS["min_data_in_leaf"], TUNED_PARAMS["min_data_in_leaf"]),
+    ("feature_fraction", BASE_PARAMS["feature_fraction"], TUNED_PARAMS["feature_fraction"]),
+    ("subsample",        BASE_PARAMS["subsample"],        TUNED_PARAMS["subsample"]),
+    ("reg_alpha (L1)",   BASE_PARAMS["reg_alpha"],        TUNED_PARAMS["reg_alpha"]),
+    ("reg_lambda (L2)",  BASE_PARAMS["reg_lambda"],       TUNED_PARAMS["reg_lambda"]),
+]
+for pname, pbase, ptuned in param_map:
+    changed = "  ←" if pbase != ptuned else ""
+    print(f"     {pname:<20} {str(pbase):>12} {str(ptuned):>12}{changed}")
+
+print(f"\n  B. Test-set AUC")
+print(f"     Baseline : {test_auc:.4f}")
+print(f"     Tuned    : {auc_te_tuned:.4f}  "
+      f"({'↑' if auc_te_tuned > test_auc else '↓'}"
+      f"{abs(auc_te_tuned - test_auc):.4f})")
+
+print(f"\n  C. Test-set backtest (thr=0.60 / 0.65 / 0.70, cost=0.10%)")
+print(f"  {'Thr':>5}  {'Base Ret':>9} {'Base Sh':>9}  "
+      f"{'Tuned Ret':>10} {'Tuned Sh':>9}  {'ΔRet':>7} {'ΔSh':>7}")
+print("  " + "-" * 66)
+base_strats = {0.60: s60, 0.65: s65, 0.70: s70}
+for thr in [0.60, 0.65, 0.70]:
+    b, t = base_strats[thr], tuned_strats[thr]
+    d_ret = t["total_return"] - b["total_return"]
+    d_sh  = t["sharpe"]       - b["sharpe"]
+    print(f"  {thr:.2f}   {b['total_return']:>9.1%} {b['sharpe']:>9.3f}  "
+          f"{t['total_return']:>10.1%} {t['sharpe']:>9.3f}  "
+          f"{d_ret:>+7.1%} {d_sh:>+7.3f}")
+
+print(f"\n  D. Walk-forward mean (thr=0.65 for tuned  |  thr=0.70 for baseline)")
+wf_base_mean  = wf_df["strat_ret"].mean()
+wf_tuned_mean = wf_t_df["strat_ret"].mean()
+wf_bh_mean    = wf_df["bh_ret"].mean()
+print(f"     B&H mean         : {wf_bh_mean:+.1%}")
+print(f"     Baseline (thr=0.70): {wf_base_mean:+.1%}  "
+      f"(Sharpe mean: {wf_df['sharpe'].mean():.3f}, "
+      f"wins: {(wf_df['excess']>0).sum()}/{len(wf_df)})")
+print(f"     Tuned    (thr=0.65): {wf_tuned_mean:+.1%}  "
+      f"(Sharpe mean: {wf_t_df['sharpe'].mean():.3f}, "
+      f"wins: {t_wins}/{len(wf_t_df)})")
+
+print(f"\n  E. Stability over 5 seeds (baseline params)")
+m, s_std = stab_df.mean(numeric_only=True), stab_df.std(numeric_only=True)
+print(f"     AUC          : {m['auc']:.4f} ± {s_std['auc']:.4f}")
+for thr in [0.60, 0.65, 0.70]:
+    k = f"{thr:.2f}"
+    print(f"     Return@{thr:.2f}  : {m[f'ret_{k}']:+.1%} ± {s_std[f'ret_{k}']:.1%}  |  "
+          f"Sharpe@{thr:.2f} : {m[f'sharpe_{k}']:.3f} ± {s_std[f'sharpe_{k}']:.3f}")
+
+print(f"\n  → equity_curve_tuned_60d.png")
 print("=" * 65)
 print(f"  Horizon       : 60 trading days (~3 months)")
 print(f"  Features      : {len(FEATURE_COLS)} total  |  {len(KEY_FEATURES)} key features")
 print(f"  Feature lag   : 1 day")
 print(f"  Fundamentals  : {len(FUND_COLS)+1} cols ({', '.join(FUND_COLS+['fund_available'])})")
-print(f"  Test AUC      : {test_auc:.4f}")
+print(f"  Test AUC      : baseline={test_auc:.4f}  tuned={auc_te_tuned:.4f}")
 print(f"  Data source   : {DATA_SOURCE}")
 print(f"  Outputs       : equity_curve_60d.png          threshold_robustness_60d.png")
-print(f"                  equity_curve_strict_60d.png  walkforward_60d.png")
-print(f"                  walkforward_strict_60d.png   vu_pa_full_pipeline_60d.csv")
+print(f"                  equity_curve_strict_60d.png  equity_curve_tuned_60d.png")
+print(f"                  walkforward_60d.png           walkforward_strict_60d.png")
+print(f"                  vu_pa_full_pipeline_60d.csv")

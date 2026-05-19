@@ -1298,6 +1298,104 @@ all_trades_df = pd.concat(all_logs.values(), ignore_index=True)
 all_trades_df.to_csv("trade_log_60d.csv", index=False)
 print(f"  → trade_log_60d.csv  ({len(all_trades_df)} rows)")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 9 — ANNUALISED PERFORMANCE SUMMARY (full test period)
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("STEP 9 — ANNUALISED PERFORMANCE  (test period, OOS)")
+print("=" * 65)
+
+def _cagr(total_ret, n_days):
+    return (1 + total_ret) ** (252 / max(n_days, 1)) - 1
+
+def _ann_vol(daily_rets):
+    return float(daily_rets.std() * np.sqrt(252))
+
+def _perf_row(label, daily_rets, equity):
+    n      = len(daily_rets)
+    tr     = float(equity.iloc[-1] - 1)
+    cg     = _cagr(tr, n)
+    mdd    = max_dd(equity)
+    vol    = _ann_vol(daily_rets)
+    sh     = sharpe(daily_rets)
+    return {"label": label, "total_return": tr, "cagr": cg,
+            "max_drawdown": mdd, "ann_vol": vol, "sharpe": sh}
+
+rows = []
+
+# Use the tuned-model predictions (same ones as Step 7C backtest)
+_close9 = test_df["Close"]
+_probs9 = prob_te_tuned
+
+# ── Buy & Hold ────────────────────────────────────────────────────────────────
+bh_ret_daily = _close9.pct_change().fillna(0.0)
+bh_equity    = (1 + bh_ret_daily).cumprod()
+rows.append(_perf_row("Buy & Hold", bh_ret_daily, bh_equity))
+
+# ── ML strategy at each threshold ────────────────────────────────────────────
+for _thr in [0.60, 0.65, 0.70]:
+    s = run_strategy(_close9, _probs9, _thr, COST_BPS)
+    rows.append(_perf_row(f"ML  thr={_thr:.2f}", s["ret_strat"], s["equity"]))
+
+# ── Benchmark 10 %/an (reference line, no drawdown / vol data) ───────────────
+rows.append({"label": "Benchmark 10%/yr", "total_return": None,
+             "cagr": 0.10, "max_drawdown": None, "ann_vol": None, "sharpe": None})
+
+perf_df = pd.DataFrame(rows)
+
+# ── Print table ───────────────────────────────────────────────────────────────
+n_test_days = len(_close9)
+print(f"\n  Period: {_close9.index[0].date()} → {_close9.index[-1].date()}"
+      f"  ({n_test_days} trading days)\n")
+hdr = (f"  {'Strategy':<20} {'TotalRet':>9} {'CAGR':>8} "
+       f"{'MaxDD':>8} {'AnnVol':>8} {'Sharpe':>8}")
+print(hdr)
+print("  " + "-" * (len(hdr) - 2))
+for r in perf_df.itertuples():
+    def _fmt_pct(v, w, sign=True):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return f"{'—':>{w}}"
+        return f"{v:>+{w}.1%}" if sign else f"{v:>{w}.1%}"
+    def _fmt_f(v, w, fmt=".3f"):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return f"{'—':>{w}}"
+        return f"{v:>{w}{fmt}}"
+    tr_s   = _fmt_pct(r.total_return, 9)
+    cagr_s = _fmt_pct(r.cagr, 8)
+    mdd_s  = _fmt_pct(r.max_drawdown, 8, sign=False)
+    vol_s  = _fmt_pct(r.ann_vol, 8, sign=False)
+    sh_s   = _fmt_f(r.sharpe, 8)
+    print(f"  {r.label:<20} {tr_s} {cagr_s} {mdd_s} {vol_s} {sh_s}")
+
+# ── Commentary ────────────────────────────────────────────────────────────────
+bh_cagr  = perf_df.loc[perf_df["label"] == "Buy & Hold", "cagr"].iloc[0]
+ml_rows  = perf_df[perf_df["label"].str.startswith("ML")]
+best_row = ml_rows.loc[ml_rows["cagr"].idxmax()]
+above_bh = ml_rows[ml_rows["cagr"] > bh_cagr]
+above_10 = ml_rows[ml_rows["cagr"] > 0.10]
+best_dd  = ml_rows.loc[ml_rows["max_drawdown"].idxmax()]   # least negative = max
+
+print()
+if not above_bh.empty:
+    print(f"  ✔ {len(above_bh)}/{len(ml_rows)} ML seuil(s) dépasse(nt) le B&H "
+          f"en CAGR — meilleur: {best_row['label']} ({best_row['cagr']:+.1%}/an)")
+else:
+    print(f"  ✗ Aucun seuil ML ne dépasse le B&H en CAGR "
+          f"(B&H = {bh_cagr:+.1%}/an, meilleur ML = {best_row['cagr']:+.1%}/an)")
+
+if not above_10.empty:
+    lbls = ", ".join(above_10["label"].tolist())
+    print(f"  ✔ Seuil(s) dépassant 10%/an : {lbls}")
+else:
+    print(f"  ✗ Aucun seuil ML n'atteint 10%/an sur cette période")
+
+best_dd_label = best_dd["label"]
+best_dd_val   = best_dd["max_drawdown"]
+best_cagr_val = best_row["cagr"]
+print(f"  ↔ Meilleur ratio rendement/risque: {best_row['label']} "
+      f"(CAGR {best_cagr_val:+.1%}, DD {best_row['max_drawdown']:.1%}) "
+      f"vs drawdown le plus faible: {best_dd_label} ({best_dd_val:.1%})")
+
 print("=" * 65)
 print(f"  Horizon       : 60 trading days (~3 months)")
 print(f"  Features      : {len(FEATURE_COLS)} total  |  {len(KEY_FEATURES)} key features")
@@ -1308,4 +1406,4 @@ print(f"  Data source   : {DATA_SOURCE}")
 print(f"  Outputs       : equity_curve_60d.png          threshold_robustness_60d.png")
 print(f"                  equity_curve_strict_60d.png  equity_curve_tuned_60d.png")
 print(f"                  walkforward_60d.png           walkforward_strict_60d.png")
-print(f"                  vu_pa_full_pipeline_60d.csv  trade_log_60d.csv")
+print(f"                  vu_pa_full_pipeline_60d.csv  trade_log_60d.csv  [Step9 table]")
